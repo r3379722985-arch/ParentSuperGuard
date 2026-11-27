@@ -16,14 +16,6 @@ import java.io.File
 
 object SystemScanner {
 
-    private val PROTECTED_TOP_DIRS = setOf(
-        "android", "dcim", "pictures", "movies", "music",
-        "download", "documents", "notifications", "ringtones",
-        "alarms", "podcasts", "recordings", "audiobooks",
-        "tencent", "weixin", "wechat", "miui", "huawei",
-        "honor", "coloros", "vivo", "oppo", "samsung"
-    )
-
     private val THUMB_DIRS = listOf(
         "DCIM/.thumbnails",
         "Pictures/.thumbnails",
@@ -61,7 +53,6 @@ object SystemScanner {
         }
     }
 
-    /** 严格只读扫描，绝不在打开界面时删除任何文件，且彻底屏蔽所有系统组件进入卸载列表 */
     suspend fun scanSnapshot(context: Context): GuardSnapshot = withContext(Dispatchers.IO) {
         GuardStore.load(context)
         val customLocked = GuardStore.customProtected.value
@@ -95,19 +86,18 @@ object SystemScanner {
             val isSys = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
 
             if (isSys) {
-                if (info.packageName in IroncladWhitelist.TRUSTED_REGULAR_APPS &&
+                if (hasUsage && ssm != null &&
+                    info.packageName in IroncladWhitelist.TRUSTED_REGULAR_APPS &&
                     !IroncladWhitelist.isStrictlyProtectedFromClean(info.packageName, context.packageName, customLocked)
                 ) {
-                    val label = try { pm.getApplicationLabel(info).toString() } catch (_: Exception) { info.packageName }
-                    var cacheBytes = 0L
-                    if (hasUsage && ssm != null) {
-                        try {
-                            cacheBytes = ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, info.packageName, userHandle)
-                                .cacheBytes.coerceAtLeast(0L)
-                        } catch (_: Exception) {
-                        }
+                    val cacheBytes = try {
+                        ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, info.packageName, userHandle)
+                            .cacheBytes.coerceAtLeast(0L)
+                    } catch (_: Exception) {
+                        0L
                     }
-                    if (!hasUsage || cacheBytes >= 5L * 1024L * 1024L) {
+                    if (cacheBytes >= 5L * 1024L * 1024L) {
+                        val label = try { pm.getApplicationLabel(info).toString() } catch (_: Exception) { info.packageName }
                         candidates.add(AppCacheCandidate(info.packageName, label, cacheBytes))
                     }
                 }
@@ -132,16 +122,14 @@ object SystemScanner {
                 )
             )
 
-            if (!strictProtected) {
-                var cacheBytes = 0L
-                if (hasUsage && ssm != null) {
-                    try {
-                        cacheBytes = ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, info.packageName, userHandle)
-                            .cacheBytes.coerceAtLeast(0L)
-                    } catch (_: Exception) {
-                    }
+            if (!strictProtected && hasUsage && ssm != null) {
+                val cacheBytes = try {
+                    ssm.queryStatsForPackage(StorageManager.UUID_DEFAULT, info.packageName, userHandle)
+                        .cacheBytes.coerceAtLeast(0L)
+                } catch (_: Exception) {
+                    0L
                 }
-                if (!hasUsage || cacheBytes >= 5L * 1024L * 1024L) {
+                if (cacheBytes >= 5L * 1024L * 1024L) {
                     candidates.add(AppCacheCandidate(info.packageName, label, cacheBytes))
                 }
             }
@@ -151,7 +139,6 @@ object SystemScanner {
         var thumbBytes = 0L
         val logFiles = mutableListOf<File>()
         var logBytes = 0L
-        val emptyDirs = mutableListOf<File>()
 
         try {
             val root = Environment.getExternalStorageDirectory()
@@ -174,14 +161,6 @@ object SystemScanner {
                         }
                     }
                 }
-                root.listFiles()?.forEach { entry ->
-                    if (entry.isDirectory) {
-                        val lower = entry.name.lowercase()
-                        if (lower !in PROTECTED_TOP_DIRS && !lower.startsWith(".")) {
-                            collectEmptyDirs(entry, 1, 3, emptyDirs)
-                        }
-                    }
-                }
             }
         } catch (_: Exception) {
         }
@@ -197,7 +176,6 @@ object SystemScanner {
             safeThumbBytes = thumbBytes,
             safeLogFiles = logFiles,
             safeLogBytes = logBytes,
-            safeEmptyDirs = emptyDirs,
             auditedApps = audits.sortedWith(
                 compareByDescending<InstalledAppAuditItem> { it.isSuspectRogue }
                     .thenByDescending { it.isCustomLocked }
@@ -217,14 +195,6 @@ object SystemScanner {
             } catch (_: Exception) {
             }
         }
-        snapshot.safeEmptyDirs.sortedByDescending { it.absolutePath.length }.forEach { d ->
-            try {
-                if (d.exists() && d.isDirectory && (d.listFiles()?.isEmpty() == true)) {
-                    d.delete()
-                }
-            } catch (_: Exception) {
-            }
-        }
         freed
     }
 
@@ -233,20 +203,6 @@ object SystemScanner {
         dir.listFiles()?.forEach { child ->
             if (child.isFile) onFile(child)
             else if (child.isDirectory && depth < maxDepth) collectFiles(child, maxDepth, depth + 1, onFile)
-        }
-    }
-
-    private fun collectEmptyDirs(dir: File, depth: Int, maxDepth: Int, out: MutableList<File>) {
-        if (depth > maxDepth) return
-        val list = dir.listFiles() ?: return
-        if (list.isEmpty()) {
-            out.add(dir)
-            return
-        }
-        list.forEach { child ->
-            if (child.isDirectory && !child.name.startsWith(".")) {
-                collectEmptyDirs(child, depth + 1, maxDepth, out)
-            }
         }
     }
 

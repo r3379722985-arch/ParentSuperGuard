@@ -5,9 +5,9 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 
 /**
- * 双层白名单 + 用户自定义保护名单（修复短关键词误匹配如 goodtime 命中 ime 的问题）：
- * - 第一层（绝对禁区）：微信、QQ、企业微信、支付宝、云闪付、数字人民币、全部银行与农商行、医保、政务、相册、闹钟、输入法、以及用户手动加锁的软件 -> 绝不清缓存、绝不强停、绝不拦截、绝不提供卸载。
- * - 第二层（正规常用大厂）：抖音、快手、淘宝、拼多多、京东、小红书、B站、地图、主流影音等 -> 绝不当流氓软件拦截或建议卸载，但【允许安全清理缓存】释放数 GB 空间！
+ * 双层白名单 + 用户自定义保护名单：
+ * - 第一层（绝对禁区）：微信、QQ、企业微信、钉钉、支付宝、云闪付、数字人民币、国家反诈中心、全部银行与农商行、医保、政务、相册、闹钟、输入法、以及用户手动加锁的软件 -> 绝不清缓存、绝不强停、绝不拦截、绝不提供卸载。
+ * - 第二层（正规常用大厂）：抖音、快手、淘宝、拼多多、京东、小红书、B站、地图、运营商营业厅、主流影音等 -> 绝不当流氓软件拦截或建议卸载，但【允许安全清理缓存】！
  */
 object IroncladWhitelist {
 
@@ -15,9 +15,11 @@ object IroncladWhitelist {
         "com.tencent.mm",                  // 微信
         "com.tencent.wework",              // 企业微信
         "com.tencent.mobileqq",            // QQ
+        "com.alibaba.android.rimet",       // 钉钉
         "com.eg.android.AlipayGphone",     // 支付宝
         "com.unionpay",                    // 云闪付
         "cn.gov.pbc.dcep",                 // 数字人民币
+        "com.hicorenational.antifraud",    // 国家反诈中心
 
         // 中国主流银行
         "com.icbc",                        // 工商银行
@@ -63,14 +65,12 @@ object IroncladWhitelist {
         "com.android.BBKClock"
     )
 
-    // 长关键词：子串匹配无歧义
     private val STRICT_SUBSTRING_KEYWORDS = listOf(
         "bank", "ebank", "mbank", "abchina", "unionpay", "alipay", "wallet",
         "gallery", "photos", "camera", "contacts", "dialer", "alarm",
         "inputmethod", "pinyin", "sogou", "baidu_input", "iflytek"
     )
 
-    // 短关键词：必须匹配完整包名分段（按 . _ - 拆分），杜绝 "goodtime" 误命中 "ime" 等假阳性
     private val STRICT_SEGMENT_TOKENS = setOf(
         "ccb", "icbc", "boc", "psbc", "cmb", "rcb", "nxbank", "rural",
         "pay", "mms", "clock", "ime", "wetype"
@@ -102,7 +102,10 @@ object IroncladWhitelist {
         "com.quark.browser",               // 夸克
         "com.UCMobile",                    // UC浏览器
         "cn.xuexi.android",                // 学习强国
-        "com.sdu.didi.psnger"              // 滴滴出行
+        "com.sdu.didi.psnger",             // 滴滴出行
+        "com.greenpoint.android.mc10086.activity", // 中国移动
+        "com.sinovatech.unicom.ui",        // 中国联通
+        "com.ct.client"                    // 中国电信
     )
 
     val ROGUE_NAME_HINTS = listOf(

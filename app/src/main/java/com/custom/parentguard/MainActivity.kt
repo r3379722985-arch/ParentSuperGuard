@@ -78,19 +78,17 @@ fun ParentSuperGuardScreen() {
 
     var snapshot by remember { mutableStateOf(GuardSnapshot()) }
     var scanning by remember { mutableStateOf(false) }
-    var cleanSettingEnabled by remember { mutableStateOf(CacheCleanAccessibilityService.isEnabled(context)) }
-    var rogueSettingEnabled by remember { mutableStateOf(RogueGuardAccessibilityService.isEnabled(context)) }
     var hasFilesPerm by remember { mutableStateOf(hasExternalStorageAccess(context)) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
     var showWechatGuide by remember { mutableStateOf(false) }
     var showRestrictedGuide by remember { mutableStateOf(false) }
     var showAppAudit by remember { mutableStateOf(false) }
 
-    val cleanSvcEnabled = cleanConnected || cleanSettingEnabled
-    val rogueSvcEnabled = rogueConnected || rogueSettingEnabled
+    // 严格以服务真实运行态为准，避免小米/vivo 僵尸无障碍导致“假就绪”或按钮卡死
+    val cleanSvcRunning = cleanConnected || CacheCleanAccessibilityService.isServiceRunning()
+    val rogueSvcRunning = rogueConnected || RogueGuardAccessibilityService.isServiceRunning()
     val isGuardPaused = nowMs < pausedUntil
 
-    // 暂停倒计时期间每 15 秒刷新一次按钮状态，到期自动恢复显示
     LaunchedEffect(pausedUntil) {
         nowMs = System.currentTimeMillis()
         while (System.currentTimeMillis() < pausedUntil) {
@@ -99,21 +97,14 @@ fun ParentSuperGuardScreen() {
         }
     }
 
-    // 监听无障碍连接状态变化（如清完 650ms 后自动 disableSelf），同步更新开关状态
-    LaunchedEffect(cleanConnected, rogueConnected) {
-        cleanSettingEnabled = CacheCleanAccessibilityService.isEnabled(context)
-        rogueSettingEnabled = RogueGuardAccessibilityService.isEnabled(context)
-    }
-
     fun refreshAll() {
         if (scanning) return
         scope.launch {
             scanning = true
             nowMs = System.currentTimeMillis()
-            cleanSettingEnabled = CacheCleanAccessibilityService.isEnabled(context)
-            rogueSettingEnabled = RogueGuardAccessibilityService.isEnabled(context)
             hasFilesPerm = hasExternalStorageAccess(context)
-            if (GuardStore.sessionActive && !(cleanConnected || cleanSettingEnabled)) {
+            // 如果之前点了清理去开无障碍，但回来时服务仍未真实运行，自动解除按钮等待态
+            if (GuardStore.sessionActive && !CacheCleanAccessibilityService.isServiceRunning()) {
                 GuardStore.resetIfServiceNotEnabled()
             }
             snapshot = SystemScanner.scanSnapshot(context)
@@ -163,7 +154,7 @@ fun ParentSuperGuardScreen() {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "安心超级卫士 v5.4",
+                        text = "安心超级卫士 v5.6",
                         fontSize = 22.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White,
@@ -202,8 +193,14 @@ fun ParentSuperGuardScreen() {
                     Column(Modifier.weight(1f)) {
                         Text("可安全清理缓存", fontSize = 14.sp, color = Color(0xFFDCFCE7))
                         Text(
-                            text = if (scanning) "扫描中..." else SystemScanner.formatBytes(snapshot.totalCleanableBytes),
-                            fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, color = Color.White
+                            text = when {
+                                scanning -> "扫描中..."
+                                !snapshot.hasUsagePermission -> "需先开统计权限"
+                                else -> SystemScanner.formatBytes(snapshot.totalCleanableBytes)
+                            },
+                            fontSize = if (!snapshot.hasUsagePermission) 22.sp else 28.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color.White
                         )
                     }
                     Column(horizontalAlignment = Alignment.End) {
@@ -213,7 +210,7 @@ fun ParentSuperGuardScreen() {
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "绝对保护：微信、QQ、支付宝、云闪付、银行、医保、相册（可安全清抖音/快手/拼多多/淘宝缓存）",
+                    text = "绝对保护：微信、QQ、支付宝、云闪付、银行、反诈、医保、相册（可安全清抖音/快手/拼多多/淘宝缓存）",
                     fontSize = 12.5.sp, color = Color(0xFFBBF7D0)
                 )
             }
@@ -232,15 +229,14 @@ fun ParentSuperGuardScreen() {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 StatusChip("统计权限", snapshot.hasUsagePermission)
-                StatusChip("清缓存", cleanSvcEnabled)
+                StatusChip("清缓存", cleanSvcRunning)
                 StatusChip("文件清理", hasFilesPerm)
-                StatusChip("防流氓", rogueSvcEnabled)
+                StatusChip("防流氓", rogueSvcRunning)
             }
         }
 
         Spacer(Modifier.height(12.dp))
 
-        // 单一横幅通知源（支持点右上角关闭，绝不互相遮盖）
         if (!bannerMessage.isNullOrBlank()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -264,7 +260,7 @@ fun ParentSuperGuardScreen() {
             Spacer(Modifier.height(12.dp))
         }
 
-        // 第 1 步：一次性使用情况权限
+        // 第 1 步（强制前置）：使用情况访问权限
         if (!snapshot.hasUsagePermission) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -274,7 +270,7 @@ fun ParentSuperGuardScreen() {
                 Column(Modifier.padding(16.dp)) {
                     Text("第 1 步（只需子女帮开一次）：查看缓存大小", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF9A3412))
                     Spacer(Modifier.height(4.dp))
-                    Text("开启后才能精准筛出大于 5MB 的大缓存软件（如抖音、拼多多、浏览器），清理又快又准。", fontSize = 14.sp, color = Color(0xFF7C2D12))
+                    Text("开启后软件才能精准挑出缓存大于 5MB 的软件来清（避免盲目翻遍手机里几十个软件吓到家长）。", fontSize = 14.sp, color = Color(0xFF7C2D12))
                     Spacer(Modifier.height(10.dp))
                     Button(
                         onClick = {
@@ -291,7 +287,7 @@ fun ParentSuperGuardScreen() {
             Spacer(Modifier.height(12.dp))
         }
 
-        // 核心大按钮：一键安全清理（使用 heightIn 适配长辈超大字体不裁切）
+        // 核心大按钮：一键安全清理（兼容真实在线态与僵尸服务休眠恢复）
         Button(
             onClick = {
                 GuardStore.postBanner(null)
@@ -301,38 +297,55 @@ fun ParentSuperGuardScreen() {
                     val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
                     val targets = cur.cacheCandidates
                     if (targets.isEmpty()) {
-                        GuardStore.postBanner("非常干净！已清理旧缩略图与系统日志 ${SystemScanner.formatBytes(extFreed)}，目前没有大于 5MB 的待清软件。")
+                        val msg = if (extFreed > 0L) {
+                            "非常干净！已清理旧缩略图与系统日志 ${SystemScanner.formatBytes(extFreed)}，目前没有大于 5MB 的待清软件。"
+                        } else {
+                            "非常干净！目前没有大于 5MB 的待清软件，手机状态良好。"
+                        }
+                        GuardStore.postBanner(msg)
                         refreshAll()
                         return@launch
                     }
+
                     GuardStore.startCleanQueue(targets, availBefore, extFreed)
-                    if (!CacheCleanAccessibilityService.isEnabled(context)) {
-                        GuardStore.postBanner("请开启「安心卫士 · 自动清缓存（清完即关）」（${rom.accessibilityPathHint}），开启后自动开始清理！")
-                        try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}
+                    val liveSvc = CacheCleanAccessibilityService.instance
+                    if (liveSvc != null) {
+                        liveSvc.beginCacheQueue()
                     } else {
-                        CacheCleanAccessibilityService.instance?.beginCacheQueue()
+                        val isZombie = CacheCleanAccessibilityService.isEnabledInSettings(context)
+                        val tip = if (isZombie) {
+                            "系统暂时休眠了清缓存服务：请在无障碍中把「安心卫士 · 自动清缓存」先关再开一次，打开后立刻自动开始清理！"
+                        } else {
+                            "请开启「安心卫士 · 自动清缓存（清完即关）」（${rom.accessibilityPathHint}），开启后自动开始清理！"
+                        }
+                        GuardStore.postBanner(tip)
+                        try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}
                     }
                 }
             },
-            enabled = !scanning && !cleanState.running,
+            enabled = !scanning && !cleanState.running && snapshot.hasUsagePermission,
             modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
             shape = RoundedCornerShape(16.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
         ) {
             Text(
                 text = when {
+                    !snapshot.hasUsagePermission -> "请先完成第 1 步（开启使用情况权限）"
                     cleanState.running -> "正在自动清理 (${cleanState.currentIndex}/${cleanState.totalCount})..."
-                    !cleanSvcEnabled -> "一键安全清理（去开清缓存开关）"
-                    else -> "一键安全清理所有高缓存软件"
+                    !cleanSvcRunning -> "一键安全清理（去开清缓存开关）"
+                    else -> "一键安全清理高缓存软件（最多前 ${GuardStore.MAX_APPS_PER_BATCH} 个）"
                 },
-                fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White
+                fontSize = 17.5.sp, fontWeight = FontWeight.Bold, color = Color.White
             )
         }
 
         if (cleanState.running) {
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
-                onClick = { GuardStore.cancelCleanQueue() },
+                onClick = {
+                    CacheCleanAccessibilityService.instance?.stopImmediately()
+                    GuardStore.cancelCleanQueue()
+                },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
                 shape = RoundedCornerShape(12.dp)
             ) {
@@ -341,7 +354,7 @@ fun ParentSuperGuardScreen() {
         }
 
         // Android 13/14/15+ 受限设置 2 步解锁引导
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (!cleanSvcEnabled || !rogueSvcEnabled)) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (!cleanSvcRunning || !rogueSvcRunning)) {
             Spacer(Modifier.height(10.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -409,7 +422,7 @@ fun ParentSuperGuardScreen() {
 
                 GuardRow(
                     "清理缓存时顺便强停多余后台",
-                    "绝不强停微信、QQ、支付宝、银行与闹钟",
+                    "绝不强停微信、QQ、支付宝、银行与闹钟（且二次核对页面应用名）",
                     cfg.alsoForceStopOnClean
                 ) { GuardStore.saveConfig(context, cfg.copy(alsoForceStopOnClean = it)) }
             }
@@ -431,10 +444,10 @@ fun ParentSuperGuardScreen() {
                 ) {
                     Text("防流氓误装与弹窗守护", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A), modifier = Modifier.weight(1f))
                     Text(
-                        text = if (rogueSvcEnabled) "常驻运行中" else "未开常驻",
+                        text = if (rogueSvcRunning) "常驻运行中" else "未开常驻",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (rogueSvcEnabled) Color(0xFF15803D) else Color(0xFF64748B)
+                        color = if (rogueSvcRunning) Color(0xFF15803D) else Color(0xFF64748B)
                     )
                 }
                 Spacer(Modifier.height(4.dp))
@@ -463,7 +476,7 @@ fun ParentSuperGuardScreen() {
 
                 GuardRow(
                     "拦截高风险/未知来源安装包弹窗（需开常驻）",
-                    "仅挡高风险与流氓马甲安装提示，不误拦官方商店更新",
+                    "仅挡高风险与流氓马甲安装提示，绝不拦截卸载或官方商店更新",
                     cfg.blockHighRiskInstall
                 ) { GuardStore.saveConfig(context, cfg.copy(blockHighRiskInstall = it)) }
 
@@ -484,17 +497,17 @@ fun ParentSuperGuardScreen() {
                         modifier = Modifier.weight(1f).heightIn(min = 44.dp),
                         shape = RoundedCornerShape(10.dp)
                     ) {
-                        Text(if (rogueSvcEnabled) "管理常驻开关" else "开启常驻守护", fontSize = 13.5.sp, fontWeight = FontWeight.Bold)
+                        Text(if (rogueSvcRunning) "管理常驻开关" else "开启常驻守护", fontSize = 13.5.sp, fontWeight = FontWeight.Bold)
                     }
 
                     OutlinedButton(
                         onClick = {
                             if (isGuardPaused) {
-                                GuardStore.pauseGuardForMinutes(0)
+                                GuardStore.pauseGuardForMinutes(context, 0)
                                 GuardStore.postBanner("已恢复防流氓拦截守护。")
                             } else {
-                                GuardStore.pauseGuardForMinutes(10)
-                                GuardStore.postBanner("已暂停防流氓拦截 10 分钟，子女现在可以放心帮家长安装软件。")
+                                GuardStore.pauseGuardForMinutes(context, 10)
+                                GuardStore.postBanner("已暂停防流氓拦截 10 分钟（已保存，后台重启不失效），子女可放心装软件。")
                             }
                         },
                         modifier = Modifier.weight(1f).heightIn(min = 44.dp),
@@ -563,7 +576,12 @@ fun ParentSuperGuardScreen() {
                 Spacer(Modifier.height(4.dp))
                 Text("已剔除微信、银行、相册；不想动某个软件也可以点「加保护」锁进白名单：", fontSize = 13.sp, color = Color(0xFF64748B))
                 Spacer(Modifier.height(8.dp))
-                if (snapshot.cacheCandidates.isEmpty()) {
+                if (!snapshot.hasUsagePermission) {
+                    Text(
+                        text = "开启上方第 1 步「使用情况权限」后，这里会自动按缓存从大到小列出需要清理的软件。",
+                        fontSize = 14.5.sp, color = Color(0xFF9A3412), fontWeight = FontWeight.SemiBold
+                    )
+                } else if (snapshot.cacheCandidates.isEmpty()) {
                     Text(
                         text = if (scanning) "扫描中..." else "目前非常干净，没有大于 5MB 缓存的软件！",
                         fontSize = 15.sp, color = Color(0xFF15803D), fontWeight = FontWeight.SemiBold
@@ -577,7 +595,7 @@ fun ParentSuperGuardScreen() {
                             Column(Modifier.weight(1f)) {
                                 Text(app.appName, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
                                 Text(
-                                    text = if (app.cacheBytes > 0) "缓存约 ${SystemScanner.formatBytes(app.cacheBytes)}" else "点击查看缓存",
+                                    text = "缓存约 ${SystemScanner.formatBytes(app.cacheBytes)}",
                                     fontSize = 13.sp, color = Color(0xFFEA580C), fontWeight = FontWeight.SemiBold
                                 )
                             }

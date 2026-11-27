@@ -1,6 +1,7 @@
 package com.custom.parentguard
 
 import android.content.Context
+import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -52,7 +53,6 @@ data class GuardSnapshot(
     val safeThumbBytes: Long = 0L,
     val safeLogFiles: List<File> = emptyList(),
     val safeLogBytes: Long = 0L,
-    val safeEmptyDirs: List<File> = emptyList(),
     val auditedApps: List<InstalledAppAuditItem> = emptyList()
 ) {
     val usedStorageBytes: Long get() = (totalStorageBytes - availStorageBytes).coerceAtLeast(0L)
@@ -61,7 +61,9 @@ data class GuardSnapshot(
 }
 
 object GuardStore {
-    private const val PREFS = "parent_super_guard_v54_prefs"
+    private const val PREFS = "parent_super_guard_prefs"
+    /** v5.4 及更早版本使用的旧文件名；首次加载时自动迁移，避免升级把家长的自定义保护名单清空 */
+    private const val LEGACY_PREFS = "parent_super_guard_v54_prefs"
     private const val K_INSTALL = "block_install"
     private const val K_QUICK = "block_quick"
     private const val K_JUMP = "block_jump"
@@ -70,6 +72,9 @@ object GuardStore {
     private const val K_BLOCKED = "blocked_cnt"
     private const val K_LOGS = "blocked_logs_v1"
     private const val K_CUSTOM_PROTECTED = "custom_protected_pkgs"
+    private const val K_PAUSED_UNTIL = "guard_paused_until_ms"
+
+    const val MAX_APPS_PER_BATCH = 20
 
     private val _config = MutableStateFlow(GuardConfig())
     val config: StateFlow<GuardConfig> = _config.asStateFlow()
@@ -86,11 +91,9 @@ object GuardStore {
     private val _cleanState = MutableStateFlow(CleanRunState())
     val cleanState: StateFlow<CleanRunState> = _cleanState.asStateFlow()
 
-    // 单一横幅通知源，修复旧横幅盖住新提示的问题
     private val _bannerMessage = MutableStateFlow<String?>(null)
     val bannerMessage: StateFlow<String?> = _bannerMessage.asStateFlow()
 
-    // 实时反映两个无障碍服务的连接状态（disableSelf 后界面秒刷新）
     private val _cleanServiceConnected = MutableStateFlow(false)
     val cleanServiceConnected: StateFlow<Boolean> = _cleanServiceConnected.asStateFlow()
 
@@ -103,6 +106,7 @@ object GuardStore {
     @Volatile var queue: List<AppCacheCandidate> = emptyList(); private set
     @Volatile var queueIndex: Int = 0; private set
     @Volatile var cleanedInSession: Int = 0; private set
+    @Volatile var remainingOverflowCount: Int = 0; private set
     @Volatile var sessionActive: Boolean = false; private set
     @Volatile var availBytesBeforeClean: Long = 0L; private set
     @Volatile var extFreedBeforeQueue: Long = 0L; private set
@@ -121,13 +125,20 @@ object GuardStore {
 
     fun isGuardTemporarilyPaused(): Boolean = System.currentTimeMillis() < _guardPausedUntilMs.value
 
-    fun pauseGuardForMinutes(minutes: Int) {
-        _guardPausedUntilMs.value = if (minutes <= 0) 0L else System.currentTimeMillis() + minutes * 60_000L
+    fun pauseGuardForMinutes(context: Context, minutes: Int) {
+        val until = if (minutes <= 0) 0L else System.currentTimeMillis() + minutes * 60_000L
+        _guardPausedUntilMs.value = until
+        try {
+            val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            sp.edit().putLong(K_PAUSED_UNTIL, until).apply()
+        } catch (_: Exception) {
+        }
     }
 
     fun load(context: Context) {
         try {
             val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            migrateLegacyPrefs(context, sp)
             _config.value = GuardConfig(
                 blockHighRiskInstall = sp.getBoolean(K_INSTALL, true),
                 blockQuickAppPopup = sp.getBoolean(K_QUICK, true),
@@ -139,6 +150,35 @@ object GuardStore {
             val savedLogs = sp.getString(K_LOGS, "") ?: ""
             _blockLogs.value = savedLogs.split("\n").filter { it.isNotBlank() }.take(15)
             _customProtected.value = sp.getStringSet(K_CUSTOM_PROTECTED, emptySet())?.toSet() ?: emptySet()
+            val savedPaused = sp.getLong(K_PAUSED_UNTIL, 0L)
+            _guardPausedUntilMs.value = if (savedPaused > System.currentTimeMillis()) savedPaused else 0L
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 一次性迁移：仅当新配置文件为空、且旧文件存在时复制全部键值，
+     * 迁移成功后清空旧文件，避免下次启动重复迁移。
+     */
+    private fun migrateLegacyPrefs(context: Context, sp: SharedPreferences) {
+        try {
+            if (sp.all.isNotEmpty()) return
+            val old = context.getSharedPreferences(LEGACY_PREFS, Context.MODE_PRIVATE)
+            val all = old.all
+            if (all.isEmpty()) return
+            val e = sp.edit()
+            all.forEach { (k, v) ->
+                when (v) {
+                    is Boolean -> e.putBoolean(k, v)
+                    is Int -> e.putInt(k, v)
+                    is Long -> e.putLong(k, v)
+                    is Float -> e.putFloat(k, v)
+                    is String -> e.putString(k, v)
+                    is Set<*> -> e.putStringSet(k, v.filterIsInstance<String>().toSet())
+                }
+            }
+            e.apply()
+            old.edit().clear().apply()
         } catch (_: Exception) {
         }
     }
@@ -192,19 +232,21 @@ object GuardStore {
         }
     }
 
-    fun startCleanQueue(apps: List<AppCacheCandidate>, availBeforeBytes: Long, extFreedBytes: Long) {
-        queue = apps
+    fun startCleanQueue(allApps: List<AppCacheCandidate>, availBeforeBytes: Long, extFreedBytes: Long) {
+        val batch = allApps.take(MAX_APPS_PER_BATCH)
+        remainingOverflowCount = (allApps.size - batch.size).coerceAtLeast(0)
+        queue = batch
         queueIndex = 0
         cleanedInSession = 0
         availBytesBeforeClean = availBeforeBytes
         extFreedBeforeQueue = extFreedBytes
-        sessionActive = apps.isNotEmpty()
+        sessionActive = batch.isNotEmpty()
         _bannerMessage.value = null
         _cleanState.value = CleanRunState(
             running = sessionActive,
             currentIndex = if (sessionActive) 1 else 0,
-            totalCount = apps.size,
-            currentAppName = apps.firstOrNull()?.appName ?: "",
+            totalCount = batch.size,
+            currentAppName = batch.firstOrNull()?.appName ?: "",
             cleanedApps = 0
         )
     }
@@ -212,6 +254,7 @@ object GuardStore {
     fun currentApp(): AppCacheCandidate? = queue.getOrNull(queueIndex)
 
     fun advanceCleanQueue(didClean: Boolean, currentAvailBytes: Long): AppCacheCandidate? {
+        if (!sessionActive) return null
         if (didClean) cleanedInSession++
         queueIndex++
         val next = queue.getOrNull(queueIndex)
@@ -224,7 +267,10 @@ object GuardStore {
             val spaceNote = if (delta >= 1024L * 1024L) {
                 "，手机腾出空间约 ${SystemScanner.formatBytes(delta)}"
             } else ""
-            finishCleanQueue("全部安全清理完成！共清理 $cleanedInSession 个软件缓存$spaceNote（微信、银行与相册均已绝对保护）。")
+            val moreNote = if (remainingOverflowCount > 0) {
+                "（已优先清完缓存最大的前 $MAX_APPS_PER_BATCH 个，其余 $remainingOverflowCount 个可按需再清）"
+            } else ""
+            finishCleanQueue("全部安全清理完成！共清理 $cleanedInSession 个软件缓存$spaceNote$moreNote。微信、银行与相册均已绝对保护。")
             return null
         }
         _cleanState.value = CleanRunState(
@@ -240,6 +286,7 @@ object GuardStore {
     fun finishCleanQueue(msg: String) {
         sessionActive = false
         queue = emptyList()
+        remainingOverflowCount = 0
         _cleanState.value = CleanRunState(
             running = false,
             currentIndex = 0,
@@ -258,7 +305,7 @@ object GuardStore {
 
     fun resetIfServiceNotEnabled() {
         if (sessionActive) {
-            finishCleanQueue("您尚未开启清缓存开关，已自动取消本次等待，随时可重新点击。")
+            finishCleanQueue("您尚未开启清缓存开关（或系统刚休眠了该服务），已自动解除等待，随时可重新点击。")
         }
     }
 }

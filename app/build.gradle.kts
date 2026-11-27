@@ -3,6 +3,17 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
+val computedVersionCode = 10 + ciRunNumber
+val computedVersionName = System.getenv("RELEASE_VERSION_NAME")
+    ?.takeIf { it.isNotBlank() }
+    ?: "5.6"
+
+val envStoreFilePath = System.getenv("SIGNING_STORE_FILE")?.takeIf { it.isNotBlank() }
+val envStoreFile = envStoreFilePath?.let { file(it) }?.takeIf { it.exists() }
+val fallbackStoreFile = file("signing/family-fixed.keystore").takeIf { it.exists() }
+val hasReleaseKeystore = (envStoreFile != null) || (fallbackStoreFile != null)
+
 android {
     namespace = "com.custom.parentguard"
     compileSdk = 34
@@ -11,17 +22,43 @@ android {
         applicationId = "com.custom.parentguard"
         minSdk = 26
         targetSdk = 34
-        versionCode = 9
-        versionName = "5.4"
+        versionCode = computedVersionCode
+        versionName = computedVersionName
+    }
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                if (envStoreFile != null) {
+                    storeFile = envStoreFile
+                    storePassword = System.getenv("SIGNING_STORE_PASSWORD") ?: ""
+                    keyAlias = System.getenv("SIGNING_KEY_ALIAS") ?: ""
+                    keyPassword = System.getenv("SIGNING_KEY_PASSWORD") ?: ""
+                } else {
+                    storeFile = fallbackStoreFile
+                    storePassword = "parentguard2026"
+                    keyAlias = "parentguard"
+                    keyPassword = "parentguard2026"
+                }
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+        }
+        debug {
+            if (hasReleaseKeystore) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

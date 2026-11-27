@@ -1,4 +1,4 @@
-name: Test, Build & Release Parent Super Guard v5.4 APK
+name: Test, Build & Release Parent Super Guard APK
 
 on:
   push:
@@ -29,25 +29,62 @@ jobs:
             yes | "$SDK_DIR/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           fi
 
+      - name: Resolve version & signing keystore
+        id: meta
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            VER="5.6"
+          fi
+          echo "RELEASE_VERSION_NAME=${VER}" >> "$GITHUB_ENV"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$SIGNING_KEY_BASE64" ]; then
+            if [ -z "$SIGNING_STORE_PASSWORD" ] || [ -z "$SIGNING_KEY_ALIAS" ] || [ -z "$SIGNING_KEY_PASSWORD" ]; then
+              echo "::error::SIGNING_KEY_BASE64 is set, but SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD is missing!"
+              exit 1
+            fi
+            # Strip Windows CRLF / spaces so PowerShell-copied Base64 always decodes cleanly
+            printf '%s' "$SIGNING_KEY_BASE64" | tr -d '\r\n\t ' | base64 -d > "${GITHUB_WORKSPACE}/app/release-secret.jks"
+            echo "SIGNING_STORE_FILE=${GITHUB_WORKSPACE}/app/release-secret.jks" >> "$GITHUB_ENV"
+            echo "Using GitHub Secrets private keystore for deterministic release signing."
+          elif [ -f "${GITHUB_WORKSPACE}/app/signing/family-fixed.keystore" ]; then
+            echo "Using repository fixed keystore (app/signing/family-fixed.keystore) for deterministic signing."
+          else
+            echo "::error::No signing keystore found! Please configure SIGNING_KEY_BASE64 (+ passwords/alias) in GitHub Secrets."
+            exit 1
+          fi
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
-      - name: Run Safety & Dialog Unit Tests + Build APK
-        run: gradle testDebugUnitTest assembleDebug --no-daemon
+      - name: Run Unit Tests & Build Signed Release APK
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: gradle testDebugUnitTest assembleRelease --no-daemon
 
-      - name: Rename APK for clarity
-        run: cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/ParentSuperGuard-v5.4.apk
+      - name: Prepare Versioned APK
+        run: |
+          cp app/build/outputs/apk/release/app-release.apk "app/build/outputs/apk/release/ParentSuperGuard-v${RELEASE_VERSION_NAME}.apk"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ParentSuperGuard-v5.4-APK
-          path: app/build/outputs/apk/debug/ParentSuperGuard-v5.4.apk
+          name: ParentSuperGuard-v${{ steps.meta.outputs.version }}-APK
+          path: app/build/outputs/apk/release/ParentSuperGuard-v${{ steps.meta.outputs.version }}.apk
 
       - name: Publish to GitHub Release (on tag push)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: app/build/outputs/apk/debug/ParentSuperGuard-v5.4.apk
+          files: app/build/outputs/apk/release/ParentSuperGuard-v${{ steps.meta.outputs.version }}.apk

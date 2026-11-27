@@ -8,10 +8,11 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * 独立服务 2（可选）：日常防流氓弹窗守护 v5.4
- * - 实时同步连接状态到 GuardStore；
- * - 优先查找标准取消按钮 android:id/button2，兜底精准文案与返回键；
- * - 绝不拦截微信、银行、正规大厂应用与官方商店更新。
+ * 独立服务 2（可选）：日常防流氓弹窗守护 v5.6
+ * 本轮关键修复：
+ * 1. 使用 CleanDecisionRules.shouldBlockInstallerWindow 判定安装器窗口，绝对放行「卸载」确认框，
+ *    彻底解决开启常驻守护后点“卸载流氓软件”被自己误拦的 Bug；
+ * 2. 冷却期内不更新 lastSeenPkg，防止快应用/流氓马甲在冷却期逃逸。
  */
 class RogueGuardAccessibilityService : AccessibilityService() {
 
@@ -20,8 +21,9 @@ class RogueGuardAccessibilityService : AccessibilityService() {
         var instance: RogueGuardAccessibilityService? = null
             private set
 
-        fun isEnabled(context: Context): Boolean {
-            if (instance != null) return true
+        fun isServiceRunning(): Boolean = instance != null
+
+        fun isEnabledInSettings(context: Context): Boolean {
             return try {
                 val enabled = Settings.Secure.getString(
                     context.contentResolver,
@@ -110,8 +112,7 @@ class RogueGuardAccessibilityService : AccessibilityService() {
 
             if (cfg.blockHighRiskInstall && winPkg in INSTALL_PKGS) {
                 val txt = collectText(root)
-                val isRiskyInstall = HIGH_RISK_INSTALL_KEYWORDS.any { txt.contains(it, ignoreCase = true) }
-                if (isRiskyInstall && canBlock()) {
+                if (CleanDecisionRules.shouldBlockInstallerWindow(txt, HIGH_RISK_INSTALL_KEYWORDS) && canBlock()) {
                     val cancel = findCancelButton(root)
                     if (cancel == null || !clickSafe(cancel)) {
                         performGlobalAction(GLOBAL_ACTION_BACK)
@@ -125,8 +126,8 @@ class RogueGuardAccessibilityService : AccessibilityService() {
                 if (canBlock()) {
                     performGlobalAction(GLOBAL_ACTION_BACK)
                     GuardStore.recordBlocked(this, "退回快应用广告弹窗")
+                    lastSeenPkg = winPkg
                 }
-                lastSeenPkg = winPkg
                 return
             }
 
@@ -136,7 +137,9 @@ class RogueGuardAccessibilityService : AccessibilityService() {
                     if (canBlock(2000L)) {
                         performGlobalAction(GLOBAL_ACTION_HOME)
                         GuardStore.recordBlocked(this, "拦住疑似流氓马甲软件乱跳")
+                        lastSeenPkg = winPkg
                     }
+                    return
                 }
             }
 
