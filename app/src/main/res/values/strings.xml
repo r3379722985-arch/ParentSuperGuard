@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">安心超级卫士</string>
+    <string name="clean_service_desc">【推荐】仅在系统设置页自动点击「清除缓存」，绝不读取微信/银行等任何其他软件，且默认清完自动关闭自身，不触发银行 App 风控。</string>
+    <string name="rogue_service_desc">【可选】拦截高风险未知来源安装包弹窗、快应用广告弹窗与流氓清理/领红包马甲乱跳。若家长常用银行软件对常驻无障碍敏感，可关闭此项，改用系统自带禁止安装未知应用。</string>
+</resources>

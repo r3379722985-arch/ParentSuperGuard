@@ -1,0 +1,30 @@
+# Gradle / Android
+.gradle/
+build/
+app/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# 签名与密钥：绝不提交
+*.jks
+*.keystore
+*.p12
+keystore.properties
+signing.properties
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.log
+*.apk
+*.aab
+
