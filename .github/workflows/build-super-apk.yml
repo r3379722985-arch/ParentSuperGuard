@@ -40,7 +40,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             VER="${GITHUB_REF#refs/tags/v}"
           else
-            VER="5.6"
+            VER="6.2"
           fi
           echo "RELEASE_VERSION_NAME=${VER}" >> "$GITHUB_ENV"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
@@ -50,7 +50,6 @@ jobs:
               echo "::error::SIGNING_KEY_BASE64 is set, but SIGNING_STORE_PASSWORD / SIGNING_KEY_ALIAS / SIGNING_KEY_PASSWORD is missing!"
               exit 1
             fi
-            # Strip Windows CRLF / spaces so PowerShell-copied Base64 always decodes cleanly
             printf '%s' "$SIGNING_KEY_BASE64" | tr -d '\r\n\t ' | base64 -d > "${GITHUB_WORKSPACE}/app/release-secret.jks"
             echo "SIGNING_STORE_FILE=${GITHUB_WORKSPACE}/app/release-secret.jks" >> "$GITHUB_ENV"
             echo "Using GitHub Secrets private keystore for deterministic release signing."

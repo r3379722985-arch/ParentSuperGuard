@@ -1,6 +1,8 @@
 package com.custom.parentguard
 
 import android.Manifest
+import android.app.Activity
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -17,15 +19,19 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -42,7 +48,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF4F7FB)) {
-                    ParentSuperGuardScreen()
+                    ParentSuperGuardApp()
                 }
             }
         }
@@ -61,7 +67,7 @@ private fun hasExternalStorageAccess(context: Context): Boolean {
 }
 
 @Composable
-fun ParentSuperGuardScreen() {
+fun ParentSuperGuardApp() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
@@ -70,25 +76,67 @@ fun ParentSuperGuardScreen() {
     val cfg by GuardStore.config.collectAsState()
     val cleanState by GuardStore.cleanState.collectAsState()
     val bannerMessage by GuardStore.bannerMessage.collectAsState()
-    val blockedCount by GuardStore.blockedCount.collectAsState()
     val blockLogs by GuardStore.blockLogs.collectAsState()
+    val cleanHistory by GuardStore.cleanHistory.collectAsState()
+    val checklistDoneIds by GuardStore.checklistDoneIds.collectAsState()
+    val notifHandledPkgs by GuardStore.notifHandledPkgs.collectAsState()
+    val adminPinHash by GuardStore.adminPinHash.collectAsState()
+    val recoveryCodeHash by GuardStore.recoveryCodeHash.collectAsState()
+    val pinFailedAttempts by GuardStore.pinFailedAttempts.collectAsState()
+    val pinLockoutUntilMs by GuardStore.pinLockoutUntilMs.collectAsState()
     val cleanConnected by GuardStore.cleanServiceConnected.collectAsState()
     val rogueConnected by GuardStore.rogueServiceConnected.collectAsState()
     val pausedUntil by GuardStore.guardPausedUntilMs.collectAsState()
+    val onboardingCompleted by GuardStore.onboardingCompleted.collectAsState()
+    val restrictedConfirmed by GuardStore.restrictedConfirmed.collectAsState()
 
     var snapshot by remember { mutableStateOf(GuardSnapshot()) }
     var scanning by remember { mutableStateOf(false) }
+    var hasUsageLive by remember { mutableStateOf(SystemScanner.hasUsageStats(context)) }
     var hasFilesPerm by remember { mutableStateOf(hasExternalStorageAccess(context)) }
+    var cleanInSettings by remember { mutableStateOf(CacheCleanAccessibilityService.isEnabledInSettings(context)) }
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
-    var showWechatGuide by remember { mutableStateOf(false) }
-    var showRestrictedGuide by remember { mutableStateOf(false) }
-    var showAppAudit by remember { mutableStateOf(false) }
 
-    // 严格以服务真实运行态为准，避免小米/vivo 僵尸无障碍导致“假就绪”或按钮卡死
+    // P3-3 修复：使用 rememberSaveable，旋转屏幕 / 分屏 / 折叠屏展开不丢失页签和解锁状态
+    var selectedTab by rememberSaveable { mutableStateOf(0) }
+    var adminUnlocked by rememberSaveable { mutableStateOf(false) }
+
+    var showUnlockDialog by remember { mutableStateOf(false) }
+    var unlockUsingRecoveryMode by remember { mutableStateOf(false) }
+    var unlockPinInput by remember { mutableStateOf("") }
+    var unlockError by remember { mutableStateOf<String?>(null) }
+
+    var showNeedSwitchDialog by remember { mutableStateOf(false) }
+    var needSwitchIsZombie by remember { mutableStateOf(false) }
+
+    var showPermissionCenter by rememberSaveable {
+        mutableStateOf(
+            PermissionStepPlanner.shouldAutoOpenCenterOnLaunch(
+                onboardingCompleted = onboardingCompleted,
+                hasUsageStats = SystemScanner.hasUsageStats(context)
+            )
+        )
+    }
+
     val cleanSvcRunning = cleanConnected || CacheCleanAccessibilityService.isServiceRunning()
     val rogueSvcRunning = rogueConnected || RogueGuardAccessibilityService.isServiceRunning()
     val isGuardPaused = nowMs < pausedUntil
+    val hasAdminPin = !adminPinHash.isNullOrBlank()
+    val hasRecoveryCode = !recoveryCodeHash.isNullOrBlank()
+    val pinLockoutRemainingMs = (pinLockoutUntilMs - nowMs).coerceAtLeast(0L)
+    val isPinLockedOut = pinLockoutRemainingMs > 0L
 
+    val permSnapshot = PermissionSnapshot(
+        hasUsageStats = hasUsageLive,
+        isAndroid13Plus = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU,
+        restrictedConfirmed = restrictedConfirmed,
+        cleanServiceRunning = cleanSvcRunning,
+        cleanServiceZombie = !cleanSvcRunning && cleanInSettings,
+        hasExternalFiles = hasFilesPerm,
+        rogueServiceRunning = rogueSvcRunning
+    )
+
+    // 暂停防流氓倒计时刷新
     LaunchedEffect(pausedUntil) {
         nowMs = System.currentTimeMillis()
         while (System.currentTimeMillis() < pausedUntil) {
@@ -97,18 +145,119 @@ fun ParentSuperGuardScreen() {
         }
     }
 
+    // P2-1 修复：管理锁冷却倒计时每秒刷新
+    LaunchedEffect(pinLockoutUntilMs, showUnlockDialog) {
+        nowMs = System.currentTimeMillis()
+        while (showUnlockDialog && System.currentTimeMillis() < pinLockoutUntilMs) {
+            delay(1_000L)
+            nowMs = System.currentTimeMillis()
+        }
+    }
+
+    // P1-1 修复：系统锁屏密码 / 指纹认证回调（验证通过立即无损重置管理锁）
+    val deviceCredentialLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            GuardStore.resetAdminPinBySystemAuth(context)
+            adminUnlocked = true
+            selectedTab = 1
+            showUnlockDialog = false
+            unlockUsingRecoveryMode = false
+            unlockPinInput = ""
+            unlockError = null
+        } else {
+            unlockError = "未完成手机锁屏验证，请重试或使用 8 位恢复码"
+        }
+    }
+
+    fun launchSystemLockScreenRecovery() {
+        val km = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+        if (km == null || !km.isDeviceSecure) {
+            if (hasRecoveryCode) {
+                unlockUsingRecoveryMode = true
+                unlockPinInput = ""
+                unlockError = "此手机未设锁屏密码，请输入设置管理锁时保存的 8 位恢复码。"
+            } else {
+                unlockError = "此手机未设锁屏密码。可在系统「设置 → 应用 → 安心超级卫士 → 清除数据」重置（会清空个人保护名单）。"
+            }
+            return
+        }
+        try {
+            @Suppress("DEPRECATION")
+            val intent = km.createConfirmDeviceCredentialIntent(
+                "验证手机身份以重置管理锁",
+                "验证手机锁屏密码或指纹后，将关闭子女管理锁并完整保留所有白名单"
+            )
+            if (intent != null) {
+                deviceCredentialLauncher.launch(intent)
+            } else {
+                unlockError = "当前系统不支持锁屏认证，请改用 8 位恢复码。"
+            }
+        } catch (_: Exception) {
+            unlockError = "无法唤起系统锁屏验证，请改用 8 位恢复码。"
+        }
+    }
+
     fun refreshAll() {
         if (scanning) return
         scope.launch {
             scanning = true
             nowMs = System.currentTimeMillis()
+            hasUsageLive = SystemScanner.hasUsageStats(context)
             hasFilesPerm = hasExternalStorageAccess(context)
-            // 如果之前点了清理去开无障碍，但回来时服务仍未真实运行，自动解除按钮等待态
+            cleanInSettings = CacheCleanAccessibilityService.isEnabledInSettings(context)
+
+            if (CacheCleanAccessibilityService.isServiceRunning() && !restrictedConfirmed) {
+                GuardStore.markRestrictedConfirmed(context, true)
+            }
             if (GuardStore.sessionActive && !CacheCleanAccessibilityService.isServiceRunning()) {
                 GuardStore.resetIfServiceNotEnabled()
             }
             snapshot = SystemScanner.scanSnapshot(context)
+            hasUsageLive = snapshot.hasUsagePermission
             scanning = false
+        }
+    }
+
+    fun launchCleanOrPrompt() {
+        if (!hasUsageLive) {
+            if (hasAdminPin && !adminUnlocked) {
+                GuardStore.postBanner("首次使用还差一步设置，请把手机交给孩子在下方「子女设置」里帮点一下。")
+            } else {
+                showPermissionCenter = true
+            }
+            return
+        }
+
+        GuardStore.postBanner(null)
+        val cur = snapshot
+        val targets = cur.cacheCandidates
+        val liveSvc = CacheCleanAccessibilityService.instance
+
+        if (targets.isNotEmpty() && liveSvc == null) {
+            needSwitchIsZombie = CacheCleanAccessibilityService.isEnabledInSettings(context)
+            showNeedSwitchDialog = true
+            return
+        }
+
+        scope.launch {
+            val availBefore = SystemScanner.getCurrentAvailBytes()
+            val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
+            if (targets.isEmpty()) {
+                val msg = if (extFreed > 0L) {
+                    GuardStore.recordCleanHistory(context, 0, extFreed)
+                    "已经清理好了！释放了 ${SystemScanner.formatBytes(extFreed)} 空间，手机现在很干净。"
+                } else {
+                    "手机现在很干净，不需要清理啦！"
+                }
+                GuardStore.postBanner(msg)
+                refreshAll()
+                return@launch
+            }
+
+            GuardStore.startCleanQueue(targets, availBefore, extFreed)
+            liveSvc?.beginCacheQueue()
         }
     }
 
@@ -117,6 +266,20 @@ fun ParentSuperGuardScreen() {
     ) { granted ->
         hasFilesPerm = granted
         if (granted) refreshAll()
+    }
+
+    fun requestExternalFilesPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                context.startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                    data = Uri.parse("package:${context.packageName}")
+                })
+            } catch (_: Exception) {
+                try { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) } catch (_: Exception) {}
+            }
+        } else {
+            legacyStorageLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -129,417 +292,482 @@ fun ParentSuperGuardScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
     }
 
+    if (showPermissionCenter) {
+        PermissionCenterScreen(
+            rom = rom,
+            permState = permSnapshot,
+            onRequestExternalFiles = { requestExternalFilesPermission() },
+            onMarkRestrictedDone = { GuardStore.markRestrictedConfirmed(context, true) },
+            onFinishAndEnterHome = {
+                if (permSnapshot.essentialReady) {
+                    GuardStore.markOnboardingCompleted(context, true)
+                }
+                showPermissionCenter = false
+                refreshAll()
+            }
+        )
+        return
+    }
+
+    if (showNeedSwitchDialog) {
+        AlertDialog(
+            onDismissRequest = { showNeedSwitchDialog = false },
+            title = {
+                Text(
+                    text = if (needSwitchIsZombie) "清理开关休息了，重新点开即可" else "需要打开一下清理开关",
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    text = if (needSwitchIsZombie) {
+                        "手机刚刚把清理开关休眠了。\n\n点下面绿色按钮后，找到「安心卫士 · 自动清缓存」，先关一下再打开，就会自动帮您清完手机垃圾！"
+                    } else {
+                        "为了安全不惹银行软件弹窗，上次清完已自动关掉开关。\n\n点下面绿色按钮后，在「已下载的应用 / 服务」里找到「安心卫士 · 自动清缓存」打开开关，就会自动开始清理。\n\n（如果不想自己找，也可以拿给孩子帮忙点一下，或让孩子在「子女设置」里改成永久免开模式。）"
+                    },
+                    fontSize = 15.sp,
+                    color = Color(0xFF334155)
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showNeedSwitchDialog = false
+                        val cur = snapshot
+                        scope.launch {
+                            val availBefore = SystemScanner.getCurrentAvailBytes()
+                            val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
+                            GuardStore.startCleanQueue(cur.cacheCandidates, availBefore, extFreed)
+                            try {
+                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            } catch (_: Exception) {
+                                GuardStore.resetIfServiceNotEnabled()
+                            }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
+                ) {
+                    Text("现在去打开", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNeedSwitchDialog = false }) {
+                    Text("先不弄了", fontSize = 15.sp, color = Color(0xFF64748B))
+                }
+            }
+        )
+    }
+
+    // P1-1 & P2-1 升级版解锁弹窗（带防穷举冷却倒计时 + 手机锁屏密码找回 + 8 位恢复码兜底）
+    if (showUnlockDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showUnlockDialog = false
+                unlockUsingRecoveryMode = false
+                unlockPinInput = ""
+                unlockError = null
+            },
+            title = {
+                Text(
+                    text = if (unlockUsingRecoveryMode) "输入 8 位备用恢复码" else "请输入 4 位子女管理密码",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
+                    Text(
+                        text = if (unlockUsingRecoveryMode) {
+                            "输入设置管理锁时保存的 8 位恢复码（不区分大小写与短横线），验证通过后将关闭管理锁。"
+                        } else {
+                            "用于防止家长误触修改高级开关，主页一键清理永远免密。"
+                        },
+                        fontSize = 13.5.sp,
+                        color = Color(0xFF475569)
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = unlockPinInput,
+                        onValueChange = { v ->
+                            if (unlockUsingRecoveryMode) {
+                                if (v.length <= 10) {
+                                    unlockPinInput = v
+                                    unlockError = null
+                                }
+                            } else {
+                                if (v.length <= 4 && v.all { it.isDigit() }) {
+                                    unlockPinInput = v
+                                    unlockError = null
+                                }
+                            }
+                        },
+                        enabled = !isPinLockedOut,
+                        label = { Text(if (unlockUsingRecoveryMode) "例如：A3K9-7B2M" else "4 位数字密码") },
+                        singleLine = true,
+                        visualTransformation = if (unlockUsingRecoveryMode) {
+                            androidx.compose.ui.text.input.VisualTransformation.None
+                        } else {
+                            PasswordVisualTransformation()
+                        },
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = if (unlockUsingRecoveryMode) KeyboardType.Ascii else KeyboardType.NumberPassword
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (isPinLockedOut) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "输错次数过多，请在 ${CleanDecisionRules.formatLockoutRemaining(pinLockoutRemainingMs)} 后重试（也可直接用手机锁屏密码找回）。",
+                            fontSize = 12.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFDC2626)
+                        )
+                    } else if (unlockError != null) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(unlockError ?: "", fontSize = 12.5.sp, color = Color(0xFFDC2626))
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    // P1-1 核心找回入口：手机锁屏密码/指纹验证重置（即使在冷却中也可使用系统锁屏验证证明机主身份）
+                    OutlinedButton(
+                        onClick = { launchSystemLockScreenRecovery() },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("忘记密码？用手机锁屏密码/指纹解锁", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2563EB))
+                    }
+
+                    if (hasRecoveryCode) {
+                        TextButton(
+                            onClick = {
+                                unlockUsingRecoveryMode = !unlockUsingRecoveryMode
+                                unlockPinInput = ""
+                                unlockError = null
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = if (unlockUsingRecoveryMode) "返回输入 4 位数字密码" else "没设锁屏密码？改用 8 位恢复码解锁",
+                                fontSize = 12.5.sp,
+                                color = Color(0xFF475569)
+                            )
+                        }
+                    }
+
+                    if (pinFailedAttempts >= 5) {
+                        Text(
+                            text = "极端兜底：如既无锁屏密码又遗失恢复码，可在系统「设置 → 应用 → 安心超级卫士 → 清除数据」重置（会清空个人保护名单）。",
+                            fontSize = 11.5.sp,
+                            color = Color(0xFF64748B)
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = !isPinLockedOut,
+                    onClick = {
+                        val res = if (unlockUsingRecoveryMode) {
+                            GuardStore.attemptResetWithRecoveryCode(context, unlockPinInput)
+                        } else {
+                            GuardStore.attemptVerifyAdminPin(context, unlockPinInput)
+                        }
+                        when (res) {
+                            is PinVerifyResult.Success -> {
+                                adminUnlocked = true
+                                selectedTab = 1
+                                showUnlockDialog = false
+                                unlockUsingRecoveryMode = false
+                                unlockPinInput = ""
+                                unlockError = null
+                            }
+                            is PinVerifyResult.LockedOut -> {
+                                nowMs = System.currentTimeMillis()
+                                unlockError = "请等待 ${CleanDecisionRules.formatLockoutRemaining(res.remainingMs)} 后重试"
+                            }
+                            is PinVerifyResult.Wrong -> {
+                                nowMs = System.currentTimeMillis()
+                                unlockError = if (res.lockoutMs > 0L) {
+                                    "密码错误（已错 ${res.failedAttempts} 次），请等待 ${CleanDecisionRules.formatLockoutRemaining(res.lockoutMs)} 后再试"
+                                } else {
+                                    if (unlockUsingRecoveryMode) "恢复码不正确，请检查后重试" else "密码不正确（已错 ${res.failedAttempts} 次）"
+                                }
+                            }
+                        }
+                    }
+                ) {
+                    Text(
+                        text = if (isPinLockedOut) {
+                            "冷却 ${CleanDecisionRules.formatLockoutRemaining(pinLockoutRemainingMs)}"
+                        } else if (unlockUsingRecoveryMode) {
+                            "验证恢复码"
+                        } else {
+                            "解锁进入"
+                        }
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showUnlockDialog = false
+                        unlockUsingRecoveryMode = false
+                        unlockPinInput = ""
+                        unlockError = null
+                    }
+                ) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+
+    Scaffold(
+        containerColor = Color(0xFFF4F7FB),
+        bottomBar = {
+            NavigationBar(containerColor = Color.White) {
+                NavigationBarItem(
+                    selected = selectedTab == 0,
+                    onClick = {
+                        selectedTab = 0
+                        if (hasAdminPin) adminUnlocked = false
+                    },
+                    icon = { Text("🏠", fontSize = 20.sp) },
+                    label = { Text("一键清理", fontSize = 14.sp, fontWeight = FontWeight.Bold) }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 1,
+                    onClick = {
+                        if (hasAdminPin && !adminUnlocked) {
+                            nowMs = System.currentTimeMillis()
+                            showUnlockDialog = true
+                        } else {
+                            selectedTab = 1
+                        }
+                    },
+                    icon = { Text(if (hasAdminPin && !adminUnlocked) "🔒" else "🔧", fontSize = 18.sp) },
+                    label = { Text("子女设置", fontSize = 13.sp, fontWeight = FontWeight.Medium) }
+                )
+            }
+        }
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            if (selectedTab == 0) {
+                ElderHomeScreen(
+                    snapshot = snapshot,
+                    cleanState = cleanState,
+                    bannerMessage = bannerMessage,
+                    latestCleanRecord = cleanHistory.firstOrNull(),
+                    hasUsageLive = hasUsageLive,
+                    scanning = scanning,
+                    onStartClean = { launchCleanOrPrompt() }
+                )
+            } else {
+                ChildToolsScreen(
+                    rom = rom,
+                    snapshot = snapshot,
+                    permSnapshot = permSnapshot,
+                    cfg = cfg,
+                    isGuardPaused = isGuardPaused,
+                    blockLogs = blockLogs,
+                    checklistDoneIds = checklistDoneIds,
+                    notifHandledPkgs = notifHandledPkgs,
+                    hasAdminPin = hasAdminPin,
+                    scanning = scanning,
+                    onOpenPermissionCenter = { showPermissionCenter = true },
+                    onRefresh = { refreshAll() }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ElderHomeScreen(
+    snapshot: GuardSnapshot,
+    cleanState: CleanRunState,
+    bannerMessage: String?,
+    latestCleanRecord: String?,
+    hasUsageLive: Boolean,
+    scanning: Boolean,
+    onStartClean: () -> Unit
+) {
+    val context = LocalContext.current
+    var showWechatGuide by remember { mutableStateOf(false) }
+    var showAutoPayGuide by remember { mutableStateOf(false) }
+
+    val usedRatio = if (snapshot.totalStorageBytes > 0) {
+        (snapshot.usedStorageBytes.toFloat() / snapshot.totalStorageBytes.toFloat()).coerceIn(0f, 1f)
+    } else 0f
+
+    val storageHeadline = when {
+        scanning -> "正在检查手机空间..."
+        snapshot.totalStorageBytes == 0L -> "手机安全守护中"
+        usedRatio >= 0.85f -> "手机有点满了，建议点下面清理"
+        else -> "手机空间很充足"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .statusBarsPadding()
-            .navigationBarsPadding()
             .verticalScroll(rememberScrollState())
-            .padding(16.dp)
+            .padding(horizontal = 18.dp, vertical = 16.dp)
     ) {
-        // 顶部超级安心看板
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(
-                    Brush.linearGradient(listOf(Color(0xFF15803D), Color(0xFF1D4ED8))),
-                    RoundedCornerShape(22.dp)
+                    Brush.linearGradient(listOf(Color(0xFF15803D), Color(0xFF0F766E))),
+                    RoundedCornerShape(24.dp)
                 )
-                .padding(20.dp)
+                .padding(22.dp)
         ) {
             Column {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "安心超级卫士 v5.6",
-                        fontSize = 22.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        modifier = Modifier.weight(1f)
-                    )
-                    TextButton(
-                        onClick = { refreshAll() },
-                        enabled = !scanning && !cleanState.running
-                    ) {
-                        Text(if (scanning) "扫描中" else "重新扫描", color = Color(0xFFFEF08A), fontWeight = FontWeight.Bold)
-                    }
-                }
                 Text(
-                    text = "已适配：${rom.displayName} · 零联网无广告",
-                    fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFFFEF08A)
+                    text = "手机安心清理",
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = Color.White
                 )
-                Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = storageHeadline,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFFFEF08A)
+                )
 
-                val ratio = if (snapshot.totalStorageBytes > 0) {
-                    (snapshot.usedStorageBytes.toFloat() / snapshot.totalStorageBytes.toFloat()).coerceIn(0f, 1f)
-                } else 0f
+                Spacer(Modifier.height(16.dp))
                 LinearProgressIndicator(
-                    progress = { ratio },
-                    modifier = Modifier.fillMaxWidth().height(10.dp),
-                    color = Color(0xFFFDE047),
+                    progress = { usedRatio },
+                    modifier = Modifier.fillMaxWidth().height(12.dp),
+                    color = if (usedRatio >= 0.85f) Color(0xFFFCA5A5) else Color(0xFFFDE047),
                     trackColor = Color(0x44000000)
                 )
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.height(8.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("已用 ${SystemScanner.formatBytes(snapshot.usedStorageBytes)}", fontSize = 14.sp, color = Color.White)
-                    Text("剩余 ${SystemScanner.formatBytes(snapshot.availStorageBytes)}", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFEF08A))
+                    Text(
+                        text = "剩余可用 ${SystemScanner.formatBytes(snapshot.availStorageBytes)}",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                    if (hasUsageLive && !scanning) {
+                        Text(
+                            text = if (snapshot.totalCleanableBytes > 0L) {
+                                "可清 ${SystemScanner.formatBytes(snapshot.totalCleanableBytes)}"
+                            } else "很干净",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFFFEF08A)
+                        )
+                    }
                 }
 
                 Spacer(Modifier.height(14.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Column(Modifier.weight(1f)) {
-                        Text("可安全清理缓存", fontSize = 14.sp, color = Color(0xFFDCFCE7))
-                        Text(
-                            text = when {
-                                scanning -> "扫描中..."
-                                !snapshot.hasUsagePermission -> "需先开统计权限"
-                                else -> SystemScanner.formatBytes(snapshot.totalCleanableBytes)
-                            },
-                            fontSize = if (!snapshot.hasUsagePermission) 22.sp else 28.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = Color.White
-                        )
-                    }
-                    Column(horizontalAlignment = Alignment.End) {
-                        Text("已挡流氓弹窗", fontSize = 14.sp, color = Color(0xFFDBEAFE))
-                        Text("$blockedCount 次", fontSize = 23.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFDE047))
-                    }
-                }
-                Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "绝对保护：微信、QQ、支付宝、云闪付、银行、反诈、医保、相册（可安全清抖音/快手/拼多多/淘宝缓存）",
-                    fontSize = 12.5.sp, color = Color(0xFFBBF7D0)
+                    text = "放心点：绝不删照片、微信聊天，也不动手机银行",
+                    fontSize = 14.sp,
+                    color = Color(0xFFDCFCE7)
                 )
             }
         }
 
-        Spacer(Modifier.height(12.dp))
-
-        // 子女配置状态速览条
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                StatusChip("统计权限", snapshot.hasUsagePermission)
-                StatusChip("清缓存", cleanSvcRunning)
-                StatusChip("文件清理", hasFilesPerm)
-                StatusChip("防流氓", rogueSvcRunning)
-            }
-        }
-
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(16.dp))
 
         if (!bannerMessage.isNullOrBlank()) {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
+                shape = RoundedCornerShape(18.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFFDCFCE7))
             ) {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, top = 14.dp, bottom = 14.dp, end = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = bannerMessage ?: "",
+                        text = bannerMessage,
                         modifier = Modifier.weight(1f),
-                        fontSize = 15.5.sp, fontWeight = FontWeight.Bold, color = Color(0xFF14532D)
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF14532D)
                     )
                     TextButton(onClick = { GuardStore.postBanner(null) }) {
-                        Text("知道了", fontSize = 13.sp, color = Color(0xFF15803D), fontWeight = FontWeight.Bold)
+                        Text("知道了", fontSize = 14.sp, color = Color(0xFF15803D), fontWeight = FontWeight.Bold)
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(14.dp))
         }
 
-        // 第 1 步（强制前置）：使用情况访问权限
-        if (!snapshot.hasUsagePermission) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF7ED))
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("第 1 步（只需子女帮开一次）：查看缓存大小", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF9A3412))
-                    Spacer(Modifier.height(4.dp))
-                    Text("开启后软件才能精准挑出缓存大于 5MB 的软件来清（避免盲目翻遍手机里几十个软件吓到家长）。", fontSize = 14.sp, color = Color(0xFF7C2D12))
-                    Spacer(Modifier.height(10.dp))
-                    Button(
-                        onClick = {
-                            try { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) } catch (_: Exception) {}
-                        },
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 50.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA580C))
-                    ) {
-                        Text("去开启「使用情况权限」", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                    }
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-        }
-
-        // 核心大按钮：一键安全清理（兼容真实在线态与僵尸服务休眠恢复）
         Button(
-            onClick = {
-                GuardStore.postBanner(null)
-                val cur = snapshot
-                scope.launch {
-                    val availBefore = SystemScanner.getCurrentAvailBytes()
-                    val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
-                    val targets = cur.cacheCandidates
-                    if (targets.isEmpty()) {
-                        val msg = if (extFreed > 0L) {
-                            "非常干净！已清理旧缩略图与系统日志 ${SystemScanner.formatBytes(extFreed)}，目前没有大于 5MB 的待清软件。"
-                        } else {
-                            "非常干净！目前没有大于 5MB 的待清软件，手机状态良好。"
-                        }
-                        GuardStore.postBanner(msg)
-                        refreshAll()
-                        return@launch
-                    }
-
-                    GuardStore.startCleanQueue(targets, availBefore, extFreed)
-                    val liveSvc = CacheCleanAccessibilityService.instance
-                    if (liveSvc != null) {
-                        liveSvc.beginCacheQueue()
-                    } else {
-                        val isZombie = CacheCleanAccessibilityService.isEnabledInSettings(context)
-                        val tip = if (isZombie) {
-                            "系统暂时休眠了清缓存服务：请在无障碍中把「安心卫士 · 自动清缓存」先关再开一次，打开后立刻自动开始清理！"
-                        } else {
-                            "请开启「安心卫士 · 自动清缓存（清完即关）」（${rom.accessibilityPathHint}），开启后自动开始清理！"
-                        }
-                        GuardStore.postBanner(tip)
-                        try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}
-                    }
-                }
-            },
-            enabled = !scanning && !cleanState.running && snapshot.hasUsagePermission,
-            modifier = Modifier.fillMaxWidth().heightIn(min = 60.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A))
+            onClick = onStartClean,
+            enabled = !scanning && !cleanState.running,
+            modifier = Modifier.fillMaxWidth().heightIn(min = 74.dp),
+            shape = RoundedCornerShape(20.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (!hasUsageLive) Color(0xFFEA580C) else Color(0xFF16A34A)
+            )
         ) {
             Text(
                 text = when {
-                    !snapshot.hasUsagePermission -> "请先完成第 1 步（开启使用情况权限）"
-                    cleanState.running -> "正在自动清理 (${cleanState.currentIndex}/${cleanState.totalCount})..."
-                    !cleanSvcRunning -> "一键安全清理（去开清缓存开关）"
-                    else -> "一键安全清理高缓存软件（最多前 ${GuardStore.MAX_APPS_PER_BATCH} 个）"
+                    !hasUsageLive -> "请孩子帮忙完成首次设置"
+                    cleanState.running -> "正在清理中 (${cleanState.currentIndex}/${cleanState.totalCount})，请稍等..."
+                    else -> "点这里 · 一键清理手机"
                 },
-                fontSize = 17.5.sp, fontWeight = FontWeight.Bold, color = Color.White
+                fontSize = 22.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color.White
             )
         }
 
         if (cleanState.running) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(10.dp))
             OutlinedButton(
                 onClick = {
                     CacheCleanAccessibilityService.instance?.stopImmediately()
-                    GuardStore.cancelCleanQueue()
+                    GuardStore.cancelCleanQueue(context)
                 },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
-                shape = RoundedCornerShape(12.dp)
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                shape = RoundedCornerShape(14.dp)
             ) {
-                Text("停止自动清理", fontSize = 16.sp, color = Color(0xFFDC2626), fontWeight = FontWeight.Bold)
+                Text("停止清理", fontSize = 18.sp, color = Color(0xFFDC2626), fontWeight = FontWeight.Bold)
             }
         }
 
-        // Android 13/14/15+ 受限设置 2 步解锁引导
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (!cleanSvcRunning || !rogueSvcRunning)) {
+        if (!latestCleanRecord.isNullOrBlank()) {
             Spacer(Modifier.height(10.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF))
-            ) {
-                Column(Modifier.padding(14.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "小米/vivo 无障碍开关变灰「受限设置」？",
-                            fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1E3A8A),
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(onClick = { showRestrictedGuide = !showRestrictedGuide }) {
-                            Text(if (showRestrictedGuide) "收起" else "2步解锁", fontWeight = FontWeight.Bold)
-                        }
-                    }
-                    if (showRestrictedGuide) {
-                        Text(
-                            text = "新系统默认锁住手动安装软件的无障碍开关，子女帮解锁一次即可：\n1. 点下面按钮打开本软件「应用信息」\n2. 点右上角「⋮ 三个点」（或底部菜单）→ 点【允许受限设置】并验证锁屏密码，回来就能开无障碍了！",
-                            fontSize = 13.5.sp, color = Color(0xFF1E40AF)
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Button(
-                            onClick = {
-                                try {
-                                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                        data = Uri.parse("package:${context.packageName}")
-                                    })
-                                } catch (_: Exception) {}
-                            },
-                            modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                            shape = RoundedCornerShape(10.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
-                        ) {
-                            Text("打开本软件「应用信息」允许受限设置", fontSize = 14.sp, color = Color.White, fontWeight = FontWeight.Bold)
-                        }
-                    }
-                }
-            }
+            Text(
+                text = "上次清理：$latestCleanRecord",
+                fontSize = 13.5.sp,
+                color = Color(0xFF64748B),
+                modifier = Modifier.padding(horizontal = 4.dp)
+            )
         }
 
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(18.dp))
 
-        // 清理与防银行风控设置
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column(Modifier.padding(16.dp)) {
-                Text("清理与防银行风控设置", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                Spacer(Modifier.height(8.dp))
-                GuardRow(
-                    "清完自动关闭「清缓存无障碍」（强烈推荐）",
-                    "清理结束立刻自动关闭，彻底规避银行 App / 云闪付风控弹窗",
-                    cfg.autoDisableCleanAccessibility
-                ) { GuardStore.saveConfig(context, cfg.copy(autoDisableCleanAccessibility = it)) }
-
-                HorizontalDivider(color = Color(0xFFE2E8F0))
-
-                GuardRow(
-                    "清理缓存时顺便强停多余后台",
-                    "绝不强停微信、QQ、支付宝、银行与闹钟（且二次核对页面应用名）",
-                    cfg.alsoForceStopOnClean
-                ) { GuardStore.saveConfig(context, cfg.copy(alsoForceStopOnClean = it)) }
-            }
-        }
-
-        Spacer(Modifier.height(14.dp))
-
-        // 独立可选防流氓弹窗守护 + 系统级防误装直达入口
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-        ) {
-            Column(Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("防流氓误装与弹窗守护", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A), modifier = Modifier.weight(1f))
-                    Text(
-                        text = if (rogueSvcRunning) "常驻运行中" else "未开常驻",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = if (rogueSvcRunning) Color(0xFF15803D) else Color(0xFF64748B)
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    text = "最稳防流氓妙招（零银行风控）：点下方按钮进入系统「安装未知应用」，把浏览器/抖音/头条的安装权限全部关掉，比常驻拦截还省心！",
-                    fontSize = 13.sp, color = Color(0xFF475569)
-                )
-                Spacer(Modifier.height(8.dp))
-
-                OutlinedButton(
-                    onClick = {
-                        try {
-                            context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES))
-                        } catch (_: Exception) {
-                            try { context.startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS)) } catch (_: Exception) {}
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text("直达系统「安装未知应用」关掉广告误装权限", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1D4ED8))
-                }
-
-                Spacer(Modifier.height(8.dp))
-                HorizontalDivider(color = Color(0xFFE2E8F0))
-
-                GuardRow(
-                    "拦截高风险/未知来源安装包弹窗（需开常驻）",
-                    "仅挡高风险与流氓马甲安装提示，绝不拦截卸载或官方商店更新",
-                    cfg.blockHighRiskInstall
-                ) { GuardStore.saveConfig(context, cfg.copy(blockHighRiskInstall = it)) }
-
-                HorizontalDivider(color = Color(0xFFE2E8F0))
-
-                GuardRow(
-                    "拦截快应用广告与流氓马甲乱跳（需开常驻）",
-                    "自动退回快应用弹窗与疑似领红包/极速清理马甲",
-                    cfg.blockQuickAppPopup && cfg.blockRogueAppJump
-                ) { GuardStore.saveConfig(context, cfg.copy(blockQuickAppPopup = it, blockRogueAppJump = it)) }
-
-                Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            try { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } catch (_: Exception) {}
-                        },
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text(if (rogueSvcRunning) "管理常驻开关" else "开启常驻守护", fontSize = 13.5.sp, fontWeight = FontWeight.Bold)
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            if (isGuardPaused) {
-                                GuardStore.pauseGuardForMinutes(context, 0)
-                                GuardStore.postBanner("已恢复防流氓拦截守护。")
-                            } else {
-                                GuardStore.pauseGuardForMinutes(context, 10)
-                                GuardStore.postBanner("已暂停防流氓拦截 10 分钟（已保存，后台重启不失效），子女可放心装软件。")
-                            }
-                        },
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text(if (isGuardPaused) "恢复拦截" else "暂停10分钟", fontSize = 13.5.sp, fontWeight = FontWeight.Bold, color = Color(0xFFEA580C))
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(14.dp))
-
-        // 微信安全清理大字向导
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFECFDF5))
-        ) {
-            Column(Modifier.padding(16.dp)) {
-                Text("微信安全清缓存（绝不丢照片和聊天）", fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF065F46))
-                Spacer(Modifier.height(6.dp))
-                Text("本软件绝不私自删微信目录。推荐走微信官方自带「存储空间 → 清理缓存」。", fontSize = 14.sp, color = Color(0xFF047857))
+                Text("💬 清理微信垃圾（不丢照片和聊天）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color(0xFF065F46))
                 Spacer(Modifier.height(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     Button(
                         onClick = { showWechatGuide = !showWechatGuide },
-                        modifier = Modifier.weight(1f).heightIn(min = 46.dp),
+                        modifier = Modifier.weight(1.1f).heightIn(min = 48.dp),
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
                     ) {
-                        Text(if (showWechatGuide) "收起步骤" else "看 3 步清微信", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        Text(if (showWechatGuide) "收起步骤" else "看 3 步怎么点", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     }
                     OutlinedButton(
                         onClick = {
@@ -547,17 +775,19 @@ fun ParentSuperGuardScreen() {
                                 try { context.startActivity(it) } catch (_: Exception) {}
                             }
                         },
-                        modifier = Modifier.weight(0.8f).heightIn(min = 46.dp),
+                        modifier = Modifier.weight(0.9f).heightIn(min = 48.dp),
                         shape = RoundedCornerShape(12.dp)
                     ) {
-                        Text("打开微信", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = Color(0xFF065F46))
+                        Text("打开微信", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF065F46))
                     }
                 }
                 if (showWechatGuide) {
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(12.dp))
                     Text(
-                        text = "1. 打开微信 → 点右下角「我」→ 点「设置」\n2. 点「通用」→ 点「存储空间」\n3. 只点「缓存」旁边的绿色【清理】按钮！（照片和聊天记录一条都不会少）",
-                        fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF064E3B)
+                        text = "1. 打开微信 → 点右下角「我」→ 点「设置」\n2. 点「通用」→ 点「存储空间」\n3. 只点「缓存」旁边的绿色【清理】按钮！\n（放心，照片和聊天记录一条都不会少）",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF064E3B)
                     )
                 }
             }
@@ -565,189 +795,55 @@ fun ParentSuperGuardScreen() {
 
         Spacer(Modifier.height(14.dp))
 
-        // 零无障碍备选：高缓存软件排行
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White)
         ) {
             Column(Modifier.padding(16.dp)) {
-                Text("高缓存软件排行（不开无障碍也能手动点）", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                Spacer(Modifier.height(4.dp))
-                Text("已剔除微信、银行、相册；不想动某个软件也可以点「加保护」锁进白名单：", fontSize = 13.sp, color = Color(0xFF64748B))
-                Spacer(Modifier.height(8.dp))
-                if (!snapshot.hasUsagePermission) {
+                Text("💸 查查有没有偷偷扣费（关自动续费）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color(0xFF9A3412))
+                Spacer(Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Button(
+                        onClick = { showAutoPayGuide = !showAutoPayGuide },
+                        modifier = Modifier.weight(1.1f).heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA580C))
+                    ) {
+                        Text(if (showAutoPayGuide) "收起步骤" else "看 3 步怎么查", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            context.packageManager.getLaunchIntentForPackage("com.eg.android.AlipayGphone")?.let {
+                                try { context.startActivity(it) } catch (_: Exception) {}
+                            }
+                        },
+                        modifier = Modifier.weight(0.9f).heightIn(min = 48.dp),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("打开支付宝", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF9A3412))
+                    }
+                }
+                if (showAutoPayGuide) {
+                    Spacer(Modifier.height(12.dp))
                     Text(
-                        text = "开启上方第 1 步「使用情况权限」后，这里会自动按缓存从大到小列出需要清理的软件。",
-                        fontSize = 14.5.sp, color = Color(0xFF9A3412), fontWeight = FontWeight.SemiBold
+                        text = "【微信查扣费】\n" +
+                               "1. 微信 →「我」→「服务」→「钱包」\n" +
+                               "2. 点下方「支付设置」→「自动续费 / 扣费服务」\n" +
+                               "3. 不认识的保险、会员、短剧扣费点进去关闭！\n\n" +
+                               "【支付宝查扣费】\n" +
+                               "1. 支付宝 → 右下角「我的」→ 右上角「设置」\n" +
+                               "2. 点「支付设置」→「免密支付 / 自动扣款」\n" +
+                               "3. 不认识的代扣项目逐个关闭！",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF7C2D12)
                     )
-                } else if (snapshot.cacheCandidates.isEmpty()) {
-                    Text(
-                        text = if (scanning) "扫描中..." else "目前非常干净，没有大于 5MB 缓存的软件！",
-                        fontSize = 15.sp, color = Color(0xFF15803D), fontWeight = FontWeight.SemiBold
-                    )
-                } else {
-                    snapshot.cacheCandidates.take(12).forEach { app ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(app.appName, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                                Text(
-                                    text = "缓存约 ${SystemScanner.formatBytes(app.cacheBytes)}",
-                                    fontSize = 13.sp, color = Color(0xFFEA580C), fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                            TextButton(
-                                onClick = {
-                                    GuardStore.toggleCustomProtected(context, app.packageName)
-                                    GuardStore.postBanner("已将「${app.appName}」加入个人保护名单，今后清理将自动跳过。")
-                                    refreshAll()
-                                }
-                            ) {
-                                Text("加保护", fontSize = 13.sp, color = Color(0xFF15803D), fontWeight = FontWeight.Bold)
-                            }
-                            Button(
-                                onClick = {
-                                    try {
-                                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                                            data = Uri.parse("package:${app.packageName}")
-                                        })
-                                    } catch (_: Exception) {}
-                                },
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
-                            ) {
-                                Text("去清理", fontSize = 14.sp, color = Color.White)
-                            }
-                        }
-                        HorizontalDivider(color = Color(0xFFF1F5F9))
-                    }
                 }
             }
         }
 
-        Spacer(Modifier.height(14.dp))
-
-        // 已装软件排查
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(18.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-        ) {
-            Column(Modifier.padding(16.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(Modifier.weight(1f)) {
-                        Text("已装软件排查（疑似流氓 ${snapshot.suspectRogueCount} 个）", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                        Text("仅排查第三方软件，绝不误列系统桌面与安全中心", fontSize = 13.sp, color = Color(0xFF64748B))
-                    }
-                    TextButton(onClick = { showAppAudit = !showAppAudit }) {
-                        Text(if (showAppAudit) "收起" else "排查", fontWeight = FontWeight.Bold)
-                    }
-                }
-                if (showAppAudit) {
-                    Spacer(Modifier.height(8.dp))
-                    snapshot.auditedApps.forEach { app ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text(app.appName, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                                Text(
-                                    text = when {
-                                        app.isBuiltInStrict -> "铁壁保护（微信/银行/相册）"
-                                        app.isCustomLocked -> "已手动加保护（不自动清理）"
-                                        app.isTrustedRegular -> "正规常用软件（安全，可清缓存）"
-                                        app.isSuspectRogue -> "疑似流氓清理/领红包马甲（建议卸载）"
-                                        else -> "普通第三方软件"
-                                    },
-                                    fontSize = 13.sp,
-                                    color = when {
-                                        app.isSuspectRogue -> Color(0xFFDC2626)
-                                        app.isStrictProtected || app.isTrustedRegular -> Color(0xFF15803D)
-                                        else -> Color(0xFF475569)
-                                    }
-                                )
-                            }
-                            if (app.isCustomLocked) {
-                                TextButton(
-                                    onClick = {
-                                        GuardStore.toggleCustomProtected(context, app.packageName)
-                                        GuardStore.postBanner("已将「${app.appName}」移出个人保护名单。")
-                                        refreshAll()
-                                    }
-                                ) {
-                                    Text("解除保护", fontSize = 13.sp, color = Color(0xFF2563EB))
-                                }
-                            } else if (!app.isBuiltInStrict && !app.isTrustedRegular) {
-                                OutlinedButton(
-                                    onClick = {
-                                        try {
-                                            context.startActivity(Intent(Intent.ACTION_DELETE).apply {
-                                                data = Uri.parse("package:${app.packageName}")
-                                            })
-                                        } catch (_: Exception) {}
-                                    },
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Text("卸载", fontSize = 14.sp, color = Color(0xFFDC2626), fontWeight = FontWeight.Bold)
-                                }
-                            }
-                        }
-                        HorizontalDivider(color = Color(0xFFF1F5F9))
-                    }
-                }
-            }
-        }
-
-        if (blockLogs.isNotEmpty()) {
-            Spacer(Modifier.height(14.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White)
-            ) {
-                Column(Modifier.padding(16.dp)) {
-                    Text("最近拦截记录（已持久化保存）", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                    Spacer(Modifier.height(6.dp))
-                    blockLogs.forEach { item ->
-                        Text("• $item", fontSize = 14.sp, color = Color(0xFF334155), modifier = Modifier.padding(vertical = 2.dp))
-                    }
-                }
-            }
-        }
-
-        if (!hasFilesPerm) {
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        try {
-                            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                data = Uri.parse("package:${context.packageName}")
-                            }
-                            context.startActivity(intent)
-                        } catch (_: Exception) {
-                            try { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) } catch (_: Exception) {}
-                        }
-                    } else {
-                        legacyStorageLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    }
-                },
-                modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Text("（可选）授权清理相册旧缩略图与系统日志", fontSize = 14.sp, color = Color(0xFF475569))
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(20.dp))
     }
 }
 
@@ -777,7 +873,7 @@ fun GuardRow(
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f).padding(end = 10.dp)) {
-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
+            Text(title, fontSize = 15.5.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
             Spacer(Modifier.height(2.dp))
             Text(desc, fontSize = 13.sp, color = Color(0xFF475569))
         }

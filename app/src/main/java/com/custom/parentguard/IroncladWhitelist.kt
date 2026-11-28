@@ -5,9 +5,10 @@ import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 
 /**
- * 双层白名单 + 用户自定义保护名单：
- * - 第一层（绝对禁区）：微信、QQ、企业微信、钉钉、支付宝、云闪付、数字人民币、国家反诈中心、全部银行与农商行、医保、政务、相册、闹钟、输入法、以及用户手动加锁的软件 -> 绝不清缓存、绝不强停、绝不拦截、绝不提供卸载。
- * - 第二层（正规常用大厂）：抖音、快手、淘宝、拼多多、京东、小红书、B站、地图、运营商营业厅、主流影音等 -> 绝不当流氓软件拦截或建议卸载，但【允许安全清理缓存】！
+ * 双层白名单 + 生活通知保护名单：
+ * - 第一层（绝对禁区）：微信、QQ、企业微信、钉钉、支付宝、云闪付、数字人民币、国家反诈中心、全部银行与农商行、医保、政务、相册、闹钟、输入法、以及用户手动加锁的软件。
+ * - 生活通知额外保护（P2-3 修复）：外卖（美团/饿了么）、快递（菜鸟/顺丰/快递100/京东）、导航打车（滴滴/高德/百度地图）及医院挂号类不建议关通知，防止漏接外卖电话、取件码与叫号提醒。
+ * - 高发广告推送大户：拼多多、头条、短视频、浏览器等，在「通知栏大扫除」默认展示供一键静音。
  */
 object IroncladWhitelist {
 
@@ -22,29 +23,29 @@ object IroncladWhitelist {
         "com.hicorenational.antifraud",    // 国家反诈中心
 
         // 中国主流银行
-        "com.icbc",                        // 工商银行
-        "com.android.bankabc",             // 农业银行
-        "com.chinamworld.main",            // 建设银行
-        "com.chinamworld.bocmbci",         // 中国银行
-        "com.bankcomm.Bankcomm",           // 交通银行
-        "com.yitong.mbank.psbc",           // 邮储银行
-        "cmb.pb",                          // 招商银行
-        "com.pingan.paces.ccms",           // 平安口袋银行
-        "com.ecitic.bank.mobile",          // 中信银行
-        "cn.com.spdb.mobilebank.per",      // 浦发银行
-        "com.cib.cibmb",                   // 兴业银行
-        "cn.com.cmbc.newmbank",            // 民生银行
-        "com.cebbank.mobile.cemb",         // 光大银行
-        "com.cgbchina.xpt",                // 广发银行
-        "com.hxb.mobile.client",           // 华夏银行
-        "com.rytong.bankps",               // 北京银行
-        "com.bosc.mobilebank",             // 上海银行
+        "com.icbc",
+        "com.android.bankabc",
+        "com.chinamworld.main",
+        "com.chinamworld.bocmbci",
+        "com.bankcomm.Bankcomm",
+        "com.yitong.mbank.psbc",
+        "cmb.pb",
+        "com.pingan.paces.ccms",
+        "com.ecitic.bank.mobile",
+        "cn.com.spdb.mobilebank.per",
+        "com.cib.cibmb",
+        "cn.com.cmbc.newmbank",
+        "com.cebbank.mobile.cemb",
+        "com.cgbchina.xpt",
+        "com.hxb.mobile.client",
+        "com.rytong.bankps",
+        "com.bosc.mobilebank",
 
         // 政务、医保、出行刚需
-        "cn.hsa.app",                      // 国家医保服务平台
-        "com.tmri.app.main",               // 交管12123
-        "com.MobileTicket",                // 铁路12306
-        "cn.gov.tax.its",                  // 个人所得税
+        "cn.hsa.app",
+        "com.tmri.app.main",
+        "com.MobileTicket",
+        "cn.gov.tax.its",
 
         // 常见输入法与各品牌相册、闹钟
         "com.sohu.inputmethod.sogou",
@@ -76,36 +77,82 @@ object IroncladWhitelist {
         "pay", "mms", "clock", "ime", "wetype"
     )
 
-    val TRUSTED_REGULAR_APPS = setOf(
-        "com.ss.android.ugc.aweme",        // 抖音
-        "com.ss.android.ugc.aweme.lite",   // 抖音极速版
-        "com.smile.gifmaker",              // 快手
-        "com.kuaishou.nebula",             // 快手极速版
-        "com.taobao.taobao",               // 淘宝
-        "com.xunmeng.pinduoduo",           // 拼多多
-        "com.jingdong.app.mall",           // 京东
-        "com.xingin.xhs",                  // 小红书
-        "tv.danmaku.bili",                 // 哔哩哔哩
+    // P2-3 修复：生活刚需通知保护（外卖、快递物流、出行导航、常见医疗挂号）
+    val KEEP_NOTIFICATION_EXTRA = setOf(
+        "com.sdu.didi.psnger",             // 滴滴出行
         "com.autonavi.minimap",            // 高德地图
         "com.baidu.BaiduMap",              // 百度地图
-        "com.ss.android.article.news",     // 今日头条
-        "com.ss.android.article.video",    // 西瓜视频
         "com.sankuai.meituan",             // 美团
-        "com.tencent.qqlive",              // 腾讯视频
-        "com.qiyi.video",                  // 爱奇艺
-        "com.youku.phone",                 // 优酷
-        "com.netease.cloudmusic",          // 网易云音乐
-        "com.tencent.qqmusic",             // QQ音乐
-        "com.kugou.android",               // 酷狗音乐
-        "com.ximalaya.ting.android",       // 喜马拉雅
-        "com.baidu.searchbox",             // 百度
-        "com.quark.browser",               // 夸克
-        "com.UCMobile",                    // UC浏览器
-        "cn.xuexi.android",                // 学习强国
-        "com.sdu.didi.psnger",             // 滴滴出行
-        "com.greenpoint.android.mc10086.activity", // 中国移动
-        "com.sinovatech.unicom.ui",        // 中国联通
-        "com.ct.client"                    // 中国电信
+        "com.sankuai.meituan.takeoutnew",  // 美团外卖
+        "me.ele",                          // 饿了么
+        "com.cainiao.wireless",            // 菜鸟驿站
+        "com.sf.activity",                 // 顺丰速运
+        "com.Kingdee.Express",             // 快递100
+        "com.jingdong.app.mall",           // 京东（保留快递配送通知）
+        "com.haodf.android",               // 好大夫在线
+        "com.greenline.guahao",            // 微医挂号
+        "com.alihealth.app",               // 阿里健康
+        "com.jd.jdh.patient"               // 京东健康
+    )
+
+    // 医疗挂号与快递物流包名关键词兜底，防止地方医院/快递 App 被误标建议关通知
+    private val KEEP_NOTIFICATION_KEYWORDS = listOf(
+        "hospital", "clinic", "guahao", "medical", "medicare", "yibao",
+        "cainiao", "kuaidi", "express", "delivery", "takeout"
+    )
+
+    // 高发广告推送大户（京东已移出，避免漏掉物流派件通知）
+    val HIGH_SPAM_NOTIFICATION_PKGS = setOf(
+        "com.xunmeng.pinduoduo",
+        "com.ss.android.article.news",
+        "com.ss.android.ugc.aweme",
+        "com.ss.android.ugc.aweme.lite",
+        "com.smile.gifmaker",
+        "com.kuaishou.nebula",
+        "com.baidu.searchbox",
+        "com.UCMobile",
+        "com.quark.browser",
+        "com.taobao.taobao",
+        "com.ss.android.article.video",
+        "com.qiyi.video",
+        "com.tencent.qqlive",
+        "com.youku.phone"
+    )
+
+    val TRUSTED_REGULAR_APPS = setOf(
+        "com.ss.android.ugc.aweme",
+        "com.ss.android.ugc.aweme.lite",
+        "com.smile.gifmaker",
+        "com.kuaishou.nebula",
+        "com.taobao.taobao",
+        "com.xunmeng.pinduoduo",
+        "com.jingdong.app.mall",
+        "com.xingin.xhs",
+        "tv.danmaku.bili",
+        "com.autonavi.minimap",
+        "com.baidu.BaiduMap",
+        "com.ss.android.article.news",
+        "com.ss.android.article.video",
+        "com.sankuai.meituan",
+        "com.sankuai.meituan.takeoutnew",
+        "me.ele",
+        "com.cainiao.wireless",
+        "com.sf.activity",
+        "com.tencent.qqlive",
+        "com.qiyi.video",
+        "com.youku.phone",
+        "com.netease.cloudmusic",
+        "com.tencent.qqmusic",
+        "com.kugou.android",
+        "com.ximalaya.ting.android",
+        "com.baidu.searchbox",
+        "com.quark.browser",
+        "com.UCMobile",
+        "cn.xuexi.android",
+        "com.sdu.didi.psnger",
+        "com.greenpoint.android.mc10086.activity",
+        "com.sinovatech.unicom.ui",
+        "com.ct.client"
     )
 
     val ROGUE_NAME_HINTS = listOf(
@@ -126,6 +173,18 @@ object IroncladWhitelist {
         if (STRICT_SUBSTRING_KEYWORDS.any { lower.contains(it) }) return true
         val segments = lower.split('.', '_', '-')
         return segments.any { it in STRICT_SEGMENT_TOKENS }
+    }
+
+    /** 是否属于重要生活/金融/医疗通知软件（绝不放进「关垃圾推送」建议列表） */
+    fun shouldKeepNotifications(
+        packageName: String,
+        selfPackage: String,
+        customProtected: Set<String> = emptySet()
+    ): Boolean {
+        if (isStrictlyProtectedFromClean(packageName, selfPackage, customProtected)) return true
+        if (packageName in KEEP_NOTIFICATION_EXTRA) return true
+        val lower = packageName.lowercase()
+        return KEEP_NOTIFICATION_KEYWORDS.any { lower.contains(it) }
     }
 
     fun isTrustedFamilyApp(

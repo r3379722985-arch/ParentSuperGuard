@@ -14,13 +14,10 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * 独立服务 1：专职多品牌安全清缓存引擎 v5.6
- * 本轮深度修复：
- * 1. MIUI_MENU 阶段改为先扫描所有窗口查找「清除缓存」，全未找到时再检查危险菜单，配合 CleanDecisionRules.isDangerOnlyMenu 彻底消除底层页面含“卸载”导致的误返回；
- * 2. 严格区分服务真实在线（isServiceRunning）与系统设置残留（isEnabledInSettings），彻底消除小米/vivo 僵尸无障碍导致的主按钮假死；
- * 3. 新增 stopImmediately() 立即清空全部延迟回调，点击「停止自动清理」时不会再被残余延时回调覆盖；
- * 4. android:id/button1 同步强制校验 exactLabels，绝不误点取消或未知文案；
- * 5. 看到二次确认弹窗后，真正点下确定按钮才计入已清理成功数，统计更诚实。
+ * 独立服务 1：专职多品牌安全清缓存引擎 v6.1
+ * 本轮修复：
+ * - 新增 pendingTransition 互斥锁与可取消的 transitionRunnable，彻底杜绝确认弹窗退场动画期间
+ *   被再次触发点击确定或重复调用 advanceApp 连跳两个软件的竞态 Bug。
  */
 class CacheCleanAccessibilityService : AccessibilityService() {
 
@@ -29,10 +26,8 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         var instance: CacheCleanAccessibilityService? = null
             private set
 
-        /** 服务当前进程是否真实在线运行 */
         fun isServiceRunning(): Boolean = instance != null
 
-        /** 系统无障碍设置里开关是否处于勾选态（注：部分机型后台休眠后可能处于勾选但未运行的僵尸态） */
         fun isEnabledInSettings(context: Context): Boolean {
             return try {
                 val enabled = Settings.Secure.getString(
@@ -62,6 +57,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     private var cleanStep = CleanStep.IDLE
     private var didCleanCurrentApp = false
     private var targetIdentityVerified = false
+    private var pendingTransition = false
     private var scrollAttemptsAppInfo = 0
     private var scrollAttemptsStorage = 0
     private var ignoreEventsUntilMs = 0L
@@ -69,9 +65,16 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     private var appTimeoutRunnable: Runnable? = null
     private var confirmFallbackRunnable: Runnable? = null
     private var pollRunnable: Runnable? = null
+    private var transitionRunnable: Runnable? = null
 
     private val EXACT_CONFIRM_OK = setOf("确定", "清除", "清空", "确认", "ok", "清除缓存", "清空缓存")
     private val EXACT_CONFIRM_STOP = setOf("确定", "强行停止", "强制停止", "结束运行", "ok", "force stop")
+    private val KNOWN_CLEAR_CACHE_VIEW_IDS = listOf(
+        "com.android.settings:id/clear_cache_button",
+        "com.android.settings:id/button2",
+        "com.oplus.appdetail:id/clear_cache_button",
+        "com.vivo.abe:id/clear_cache_button"
+    )
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -106,7 +109,6 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         openNextCacheTarget()
     }
 
-    /** 点击「停止自动清理」时立刻终止所有挂起的延迟回调与状态机 */
     fun stopImmediately() {
         clearTimers()
         cleanStep = CleanStep.IDLE
@@ -133,6 +135,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         cleanStep = CleanStep.APP_INFO
         didCleanCurrentApp = false
         targetIdentityVerified = false
+        pendingTransition = false
         scrollAttemptsAppInfo = 0
         scrollAttemptsStorage = 0
         lastActionMs = 0L
@@ -153,6 +156,20 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         } catch (_: Exception) {
             advanceApp(false)
         }
+    }
+
+    private fun scheduleTransition(delayMs: Long, action: () -> Unit) {
+        transitionRunnable?.let { handler.removeCallbacks(it) }
+        pendingTransition = true
+        val r = Runnable {
+            pendingTransition = false
+            transitionRunnable = null
+            if (GuardStore.sessionActive) {
+                action()
+            }
+        }
+        transitionRunnable = r
+        handler.postDelayed(r, delayMs)
     }
 
     private fun scheduleTimeout(ms: Long) {
@@ -180,7 +197,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     private fun scheduleConfirmFallback() {
         confirmFallbackRunnable?.let { handler.removeCallbacks(it) }
         val r = Runnable {
-            if (GuardStore.sessionActive && cleanStep == CleanStep.CACHE_CONFIRM) {
+            if (GuardStore.sessionActive && !pendingTransition && cleanStep == CleanStep.CACHE_CONFIRM) {
                 afterCacheStep()
             }
         }
@@ -189,15 +206,19 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     }
 
     private fun clearTimers() {
+        pendingTransition = false
         appTimeoutRunnable?.let { handler.removeCallbacks(it) }
         appTimeoutRunnable = null
         confirmFallbackRunnable?.let { handler.removeCallbacks(it) }
         confirmFallbackRunnable = null
         pollRunnable?.let { handler.removeCallbacks(it) }
         pollRunnable = null
+        transitionRunnable?.let { handler.removeCallbacks(it) }
+        transitionRunnable = null
     }
 
     private fun isCoolingDown(gapMs: Long = 220L): Boolean {
+        if (pendingTransition) return true
         val now = System.currentTimeMillis()
         if (now < ignoreEventsUntilMs) return true
         return (now - lastActionMs) < gapMs
@@ -212,7 +233,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null || !GuardStore.sessionActive) return
+        if (event == null || !GuardStore.sessionActive || pendingTransition) return
         if (System.currentTimeMillis() < ignoreEventsUntilMs) return
         processCurrentWindows()
     }
@@ -251,7 +272,6 @@ class CacheCleanAccessibilityService : AccessibilityService() {
                     }
                 }
                 CleanStep.MIUI_MENU -> {
-                    // 先在所有窗口中寻找「清除缓存」选项，确保不会因为窗口顺序先误判其他窗口
                     for (r in roots) {
                         if (tryClickMiuiClearCacheOption(r)) return
                     }
@@ -280,6 +300,25 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         }
     }
 
+    private fun findClearCacheNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        for (vid in KNOWN_CLEAR_CACHE_VIEW_IDS) {
+            val nodes = root.findAccessibilityNodeInfosByViewId(vid)
+            if (!nodes.isNullOrEmpty()) {
+                for (cand in nodes) {
+                    val txt = (cand.text?.toString() ?: cand.contentDescription?.toString() ?: "").trim().lowercase()
+                    if (txt.isNotEmpty() &&
+                        !hasAny(txt, CleanDecisionRules.ABSOLUTE_FORBIDDEN) &&
+                        !hasAny(txt, CleanDecisionRules.NON_MIUI_FORBIDDEN) &&
+                        rom.clearCacheLabels.any { txt == it || txt.startsWith(it) }
+                    ) {
+                        return cand
+                    }
+                }
+            }
+        }
+        return findNode(root, rom.clearCacheLabels, allowMiuiMenu = false, maxExtraChars = 6)
+    }
+
     private fun onCleanAppInfo(root: AccessibilityNodeInfo, winPkg: String): Boolean {
         val target = GuardStore.currentApp() ?: return false
         val winTxt = windowText(root)
@@ -291,7 +330,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
             targetIdentityVerified = true
         }
 
-        val directCache = findNode(root, rom.clearCacheLabels, allowMiuiMenu = false, maxExtraChars = 6)
+        val directCache = findClearCacheNode(root)
         if (directCache != null) {
             markActionTaken()
             if (isEffectivelyEnabled(directCache)) {
@@ -343,11 +382,10 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     }
 
     private fun tryClickMiuiClearCacheOption(root: AccessibilityNodeInfo): Boolean {
-        val cacheOpt = findNode(root, rom.clearCacheLabels, allowMiuiMenu = false, maxExtraChars = 6)
+        val cacheOpt = findClearCacheNode(root)
         if (cacheOpt != null && isEffectivelyEnabled(cacheOpt)) {
             markActionTaken(320L)
             if (safeClick(cacheOpt)) {
-                // 小米点完菜单里的清除缓存后通常会弹二次确认框，先标 true 供无弹窗机型兜底，若看到弹窗则在点确定时最终确认
                 didCleanCurrentApp = true
                 cleanStep = CleanStep.CACHE_CONFIRM
                 scheduleTimeout(3200L)
@@ -362,18 +400,16 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     private fun tryDismissDangerOnlyMenu(root: AccessibilityNodeInfo): Boolean {
         val txt = windowText(root)
         if (CleanDecisionRules.isDangerOnlyMenu(txt, rom.clearCacheLabels)) {
-            markActionTaken(250L)
+            markActionTaken(340L)
             performGlobalAction(GLOBAL_ACTION_BACK)
-            handler.postDelayed({
-                if (GuardStore.sessionActive) afterCacheStep()
-            }, 300L)
+            scheduleTransition(300L) { afterCacheStep() }
             return true
         }
         return false
     }
 
     private fun onCleanStoragePage(root: AccessibilityNodeInfo, winPkg: String): Boolean {
-        val cacheBtn = findNode(root, rom.clearCacheLabels, allowMiuiMenu = false, maxExtraChars = 6)
+        val cacheBtn = findClearCacheNode(root)
         if (cacheBtn != null) {
             markActionTaken()
             if (isEffectivelyEnabled(cacheBtn)) {
@@ -419,24 +455,21 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         return when (CleanDecisionRules.evaluateCacheConfirmWindow(txt)) {
             DialogDecision.NOT_A_DIALOG, DialogDecision.WAIT_TRANSITION -> false
             DialogDecision.ABORT_DANGEROUS -> {
-                markActionTaken(250L)
+                markActionTaken(300L)
                 didCleanCurrentApp = false
                 performGlobalAction(GLOBAL_ACTION_BACK)
-                advanceApp(false)
+                scheduleTransition(250L) { advanceApp(false) }
                 true
             }
             DialogDecision.CONFIRM_CACHE -> {
-                // 既然真正出现了二次确认弹窗，就必须等到点下确定按钮才算清理成功
                 didCleanCurrentApp = false
                 val positiveBtn = findDialogPositiveButton(root, EXACT_CONFIRM_OK)
                 if (positiveBtn != null && isEffectivelyEnabled(positiveBtn)) {
                     confirmFallbackRunnable?.let { handler.removeCallbacks(it) }
-                    markActionTaken(280L)
+                    markActionTaken(400L)
                     val clicked = safeClick(positiveBtn)
                     didCleanCurrentApp = clicked
-                    handler.postDelayed({
-                        if (GuardStore.sessionActive) afterCacheStep()
-                    }, 360L)
+                    scheduleTransition(360L) { afterCacheStep() }
                     true
                 } else {
                     false
@@ -474,11 +507,9 @@ class CacheCleanAccessibilityService : AccessibilityService() {
         if (CleanDecisionRules.isForceStopConfirmWindow(txt)) {
             val ok = findDialogPositiveButton(root, EXACT_CONFIRM_STOP)
             if (ok != null && isEffectivelyEnabled(ok)) {
-                markActionTaken(260L)
+                markActionTaken(400L)
                 safeClick(ok)
-                handler.postDelayed({
-                    if (GuardStore.sessionActive) advanceApp(didCleanCurrentApp)
-                }, 360L)
+                scheduleTransition(360L) { advanceApp(didCleanCurrentApp) }
                 return true
             }
         }
@@ -510,7 +541,7 @@ class CacheCleanAccessibilityService : AccessibilityService() {
             return
         }
         val availNow = SystemScanner.getCurrentAvailBytes()
-        val next = GuardStore.advanceCleanQueue(didClean, availNow)
+        val next = GuardStore.advanceCleanQueue(this, didClean, availNow)
         if (next == null) {
             finishQueueAndReturn()
         } else {
@@ -538,7 +569,6 @@ class CacheCleanAccessibilityService : AccessibilityService() {
     }
 
     private fun findDialogPositiveButton(root: AccessibilityNodeInfo, exactLabels: Set<String>): AccessibilityNodeInfo? {
-        // 即使命中 android:id/button1，也必须强制校验文案在安全确定词集合内，绝不误点取消或其他未知按钮
         val byId = root.findAccessibilityNodeInfosByViewId("android:id/button1")
         if (!byId.isNullOrEmpty()) {
             val cand = byId.first()

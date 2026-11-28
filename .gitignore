@@ -7,6 +7,6 @@ local.properties
 .idea/
 .DS_Store
 
-# Keep local private release keystores out of git, while keeping the fixed family fallback keystore
+# Keep local private release keystores out of git, while keeping the optional family fallback keystore
 *.jks
 !app/signing/family-fixed.keystore

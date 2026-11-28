@@ -4,10 +4,10 @@ plugins {
 }
 
 val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
-val computedVersionCode = 10 + ciRunNumber
+val computedVersionCode = 22 + ciRunNumber
 val computedVersionName = System.getenv("RELEASE_VERSION_NAME")
     ?.takeIf { it.isNotBlank() }
-    ?: "5.6"
+    ?: "6.2"
 
 val envStoreFilePath = System.getenv("SIGNING_STORE_FILE")?.takeIf { it.isNotBlank() }
 val envStoreFile = envStoreFilePath?.let { file(it) }?.takeIf { it.exists() }

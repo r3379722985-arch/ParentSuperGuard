@@ -53,6 +53,30 @@ object SystemScanner {
         }
     }
 
+    /**
+     * P3-2 尽力探测其他应用通知状态：
+     * Android 新版本普通无权限 App 跨包查 AppOps 通常会抛 SecurityException，这里安全兜底返回 UNKNOWN，
+     * 由 GuardStore 本地「已处理」标记接力提供准确的状态反馈。
+     */
+    private fun probeAppNotificationState(appOps: AppOpsManager?, info: ApplicationInfo): AppNotifState {
+        if (appOps == null) return AppNotifState.UNKNOWN
+        return try {
+            val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                appOps.unsafeCheckOpNoThrow("android:post_notification", info.uid, info.packageName)
+            } else {
+                @Suppress("DEPRECATION")
+                appOps.checkOpNoThrow("android:post_notification", info.uid, info.packageName)
+            }
+            when (mode) {
+                AppOpsManager.MODE_IGNORED, AppOpsManager.MODE_ERRORED -> AppNotifState.DISABLED
+                AppOpsManager.MODE_ALLOWED -> AppNotifState.ENABLED
+                else -> AppNotifState.UNKNOWN
+            }
+        } catch (_: Throwable) {
+            AppNotifState.UNKNOWN
+        }
+    }
+
     suspend fun scanSnapshot(context: Context): GuardSnapshot = withContext(Dispatchers.IO) {
         GuardStore.load(context)
         val customLocked = GuardStore.customProtected.value
@@ -66,6 +90,11 @@ object SystemScanner {
 
         val hasUsage = hasUsageStats(context)
         val pm = context.packageManager
+        val appOps = try {
+            context.getSystemService(Context.APP_OPS_SERVICE) as? AppOpsManager
+        } catch (_: Exception) {
+            null
+        }
         val ssm = try {
             context.getSystemService(Context.STORAGE_STATS_SERVICE) as? StorageStatsManager
         } catch (_: Exception) {
@@ -80,6 +109,7 @@ object SystemScanner {
 
         val candidates = mutableListOf<AppCacheCandidate>()
         val audits = mutableListOf<InstalledAppAuditItem>()
+        val notifCandidates = mutableListOf<NotificationMuteCandidate>()
 
         for (info in installed) {
             if (info.packageName == context.packageName) continue
@@ -121,6 +151,20 @@ object SystemScanner {
                     isSuspectRogue = suspectRogue
                 )
             )
+
+            // 通知栏垃圾大扫除列表：自动剔除金融/反诈/外卖/快递/导航/医疗挂号软件
+            if (!IroncladWhitelist.shouldKeepNotifications(info.packageName, context.packageName, customLocked)) {
+                val highSpam = suspectRogue || (info.packageName in IroncladWhitelist.HIGH_SPAM_NOTIFICATION_PKGS)
+                val notifState = probeAppNotificationState(appOps, info)
+                notifCandidates.add(
+                    NotificationMuteCandidate(
+                        packageName = info.packageName,
+                        appName = label,
+                        isHighSpam = highSpam,
+                        systemNotifState = notifState
+                    )
+                )
+            }
 
             if (!strictProtected && hasUsage && ssm != null) {
                 val cacheBytes = try {
@@ -180,6 +224,11 @@ object SystemScanner {
                 compareByDescending<InstalledAppAuditItem> { it.isSuspectRogue }
                     .thenByDescending { it.isCustomLocked }
                     .thenBy { it.isBuiltInStrict }
+            ),
+            notificationCandidates = notifCandidates.sortedWith(
+                compareByDescending<NotificationMuteCandidate> { it.isHighSpam }
+                    .thenBy { it.systemNotifState == AppNotifState.DISABLED }
+                    .thenBy { it.appName }
             )
         )
     }
