@@ -1,4 +1,4 @@
-# 🛡️ 安心超级卫士（ParentSuperGuard v6.2 开源版）
+# 🛡️ 安心超级卫士（ParentSuperGuard v7.1 开源版）
 
 > **免 Root · 免 Shizuku · 零联网无广告 · 铁壁保护微信/银行/相册 · 长辈极简与子女管理双模式**
 
@@ -10,7 +10,7 @@
 
 市面上很多清理软件要么满屏广告诱导下载流氓马甲，要么需要 Root / Shizuku（重启失效、长辈根本不会弄），还容易误删微信聊天或触发银行 App 无障碍风控。
 
-**安心超级卫士 v6.2** 把开源社区里经过验证的最佳实践整合进一个不到 5 MB 的离线应用里：
+**安心超级卫士 v7.1** 把开源社区里经过验证的最佳实践整合进一个不到 5 MB 的离线应用里：
 
 | 核心特性 | 设计说明 |
 | :--- | :--- |
@@ -45,7 +45,7 @@
 
 本项目自带 GitHub Actions 工作流（`.github/workflows/build-super-apk.yml`）：
 * 推送 `main` 分支自动执行 `gradle testDebugUnitTest assembleRelease` 跑安全单测并产出签名 APK（在 **Actions → Artifacts** 下载）；
-* 推送版本标签（例如 `git tag v6.2 && git push origin v6.2`）自动在右侧 **Releases** 发布 `ParentSuperGuard-v6.2.apk`。
+* 推送版本标签（例如 `git tag v7.1 && git push origin v7.1`）自动在右侧 **Releases** 发布 `ParentSuperGuard-v7.1.apk`。
 
 ### 配置私有发布签名（长期开源强烈建议）
 在 GitHub 仓库 `Settings → Secrets and variables → Actions` 配置以下 4 项后，删掉仓库内兜底证书 `app/signing/family-fixed.keystore` 即可：

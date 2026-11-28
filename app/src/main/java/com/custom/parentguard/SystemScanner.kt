@@ -78,7 +78,7 @@ object SystemScanner {
     }
 
     suspend fun scanSnapshot(context: Context): GuardSnapshot = withContext(Dispatchers.IO) {
-        GuardStore.load(context)
+        GuardStore.ensureLoaded(context)
         val customLocked = GuardStore.customProtected.value
 
         val (totalSpace, availSpace) = try {
@@ -209,7 +209,15 @@ object SystemScanner {
         } catch (_: Exception) {
         }
 
-        val sortedCandidates = candidates.sortedByDescending { it.cacheBytes }
+        val nowMs = System.currentTimeMillis()
+        val filteredCandidates = CleanDecisionRules.filterRecentlyCleaned(
+            items = candidates,
+            recentlyCleanedTimestamps = GuardStore.getActiveRecentlyCleaned(nowMs),
+            nowMs = nowMs,
+            ttlMs = GuardStore.RECENTLY_CLEANED_TTL_MS,
+            packageSelector = { it.packageName }
+        )
+        val sortedCandidates = filteredCandidates.sortedByDescending { it.cacheBytes }
         GuardSnapshot(
             totalStorageBytes = totalSpace,
             availStorageBytes = availSpace,
@@ -229,7 +237,8 @@ object SystemScanner {
                 compareByDescending<NotificationMuteCandidate> { it.isHighSpam }
                     .thenBy { it.systemNotifState == AppNotifState.DISABLED }
                     .thenBy { it.appName }
-            )
+            ),
+            scannedAtMs = nowMs
         )
     }
 
@@ -245,6 +254,39 @@ object SystemScanner {
             }
         }
         freed
+    }
+
+    /** 供无障碍服务在真正启动清理会话时于后台线程执行，避免用户未开开关提前返回时误删文件 */
+    fun cleanExternalSafeFilesSync(): Long {
+        var freed = 0L
+        try {
+            val root = Environment.getExternalStorageDirectory()
+            if (!root.exists() || !root.canRead()) return 0L
+            val targets = mutableListOf<File>()
+            for (rel in THUMB_DIRS) {
+                val d = File(root, rel)
+                if (d.exists() && d.isDirectory) {
+                    collectFiles(d, 2) { targets.add(it) }
+                }
+            }
+            for (rel in SAFE_LOG_DIRS) {
+                val d = File(root, rel)
+                if (d.exists() && d.isDirectory) {
+                    collectFiles(d, 4) { targets.add(it) }
+                }
+            }
+            for (f in targets) {
+                try {
+                    if (f.exists() && f.isFile) {
+                        val len = f.length().coerceAtLeast(0L)
+                        if (f.delete()) freed += len
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return freed
     }
 
     private fun collectFiles(dir: File, maxDepth: Int, depth: Int = 0, onFile: (File) -> Unit) {

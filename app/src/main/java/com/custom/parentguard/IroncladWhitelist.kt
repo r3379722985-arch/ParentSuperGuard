@@ -152,7 +152,9 @@ object IroncladWhitelist {
         "com.sdu.didi.psnger",
         "com.greenpoint.android.mc10086.activity",
         "com.sinovatech.unicom.ui",
-        "com.ct.client"
+        "com.ct.client",
+        "com.dragon.read",
+        "com.kmxs.reader"
     )
 
     val ROGUE_NAME_HINTS = listOf(

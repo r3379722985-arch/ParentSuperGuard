@@ -38,13 +38,15 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        GuardStore.load(this)
+        GuardStore.ensureLoaded(this)
         setContent {
             MaterialTheme(colorScheme = lightColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFFF4F7FB)) {
@@ -105,6 +107,7 @@ fun ParentSuperGuardApp() {
     var unlockUsingRecoveryMode by remember { mutableStateOf(false) }
     var unlockPinInput by remember { mutableStateOf("") }
     var unlockError by remember { mutableStateOf<String?>(null) }
+    var isVerifyingPin by remember { mutableStateOf(false) }
 
     var showNeedSwitchDialog by remember { mutableStateOf(false) }
     var needSwitchIsZombie by remember { mutableStateOf(false) }
@@ -136,6 +139,14 @@ fun ParentSuperGuardApp() {
         rogueServiceRunning = rogueSvcRunning
     )
 
+    // P2-9 修复：自动关闭无障碍（disableSelf）后延迟刷新系统设置态，消除回主页状态灯短暂不一致
+    LaunchedEffect(cleanConnected) {
+        if (!cleanConnected) {
+            delay(800L)
+            cleanInSettings = CacheCleanAccessibilityService.isEnabledInSettings(context)
+        }
+    }
+
     // 暂停防流氓倒计时刷新
     LaunchedEffect(pausedUntil) {
         nowMs = System.currentTimeMillis()
@@ -159,13 +170,17 @@ fun ParentSuperGuardApp() {
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            GuardStore.resetAdminPinBySystemAuth(context)
-            adminUnlocked = true
-            selectedTab = 1
-            showUnlockDialog = false
-            unlockUsingRecoveryMode = false
-            unlockPinInput = ""
-            unlockError = null
+            scope.launch {
+                withContext(Dispatchers.IO) {
+                    GuardStore.resetAdminPinBySystemAuth(context)
+                }
+                adminUnlocked = true
+                selectedTab = 1
+                showUnlockDialog = false
+                unlockUsingRecoveryMode = false
+                unlockPinInput = ""
+                unlockError = null
+            }
         } else {
             unlockError = "未完成手机锁屏验证，请重试或使用 8 位恢复码"
         }
@@ -211,12 +226,27 @@ fun ParentSuperGuardApp() {
             if (CacheCleanAccessibilityService.isServiceRunning() && !restrictedConfirmed) {
                 GuardStore.markRestrictedConfirmed(context, true)
             }
+            // P1-3 修复：不再在 ON_RESUME 一刀切取消（防止锁屏认证/授权/转屏误杀任务），
+            // 仅在服务已停止时复位；若用户主动切回主页，由服务 2-hit 看门狗或主页「停止」按钮裁决
             if (GuardStore.sessionActive && !CacheCleanAccessibilityService.isServiceRunning()) {
                 GuardStore.resetIfServiceNotEnabled()
             }
             snapshot = SystemScanner.scanSnapshot(context)
             hasUsageLive = snapshot.hasUsagePermission
             scanning = false
+        }
+    }
+
+    /** P2-8 & P3-4：共享 45 秒快照新鲜度检查，主页大按钮与「现在去打开」弹窗统一复用 */
+    suspend fun prepareFreshSnapshot(): GuardSnapshot {
+        return if (snapshot.scannedAtMs == 0L || System.currentTimeMillis() - snapshot.scannedAtMs > 45_000L) {
+            scanning = true
+            val fresh = try { SystemScanner.scanSnapshot(context) } finally { scanning = false }
+            snapshot = fresh
+            hasUsageLive = fresh.hasUsagePermission
+            fresh
+        } else {
+            snapshot
         }
     }
 
@@ -231,17 +261,17 @@ fun ParentSuperGuardApp() {
         }
 
         GuardStore.postBanner(null)
-        val cur = snapshot
-        val targets = cur.cacheCandidates
-        val liveSvc = CacheCleanAccessibilityService.instance
-
-        if (targets.isNotEmpty() && liveSvc == null) {
-            needSwitchIsZombie = CacheCleanAccessibilityService.isEnabledInSettings(context)
-            showNeedSwitchDialog = true
-            return
-        }
-
         scope.launch {
+            val cur = prepareFreshSnapshot()
+
+            val targets = cur.cacheCandidates
+            val currentSvc = CacheCleanAccessibilityService.instance
+            if (targets.isNotEmpty() && currentSvc == null) {
+                needSwitchIsZombie = CacheCleanAccessibilityService.isEnabledInSettings(context)
+                showNeedSwitchDialog = true
+                return@launch
+            }
+
             val availBefore = SystemScanner.getCurrentAvailBytes()
             val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
             if (targets.isEmpty()) {
@@ -256,8 +286,19 @@ fun ParentSuperGuardApp() {
                 return@launch
             }
 
-            GuardStore.startCleanQueue(targets, availBefore, extFreed)
-            liveSvc?.beginCacheQueue()
+            val queuedCount = GuardStore.startCleanQueue(targets, availBefore, extFreed)
+            if (queuedCount == 0) {
+                GuardStore.postBanner("刚刚已经全部清理过啦，手机现在很干净！")
+                refreshAll()
+                return@launch
+            }
+            // P1-6 修复：启动前再次实时取 instance，避免点击瞬间服务销毁导致主页永久卡死
+            val liveNow = CacheCleanAccessibilityService.instance
+            if (liveNow != null) {
+                liveNow.beginCacheQueue()
+            } else {
+                GuardStore.resetIfServiceNotEnabled()
+            }
         }
     }
 
@@ -334,11 +375,16 @@ fun ParentSuperGuardApp() {
                 Button(
                     onClick = {
                         showNeedSwitchDialog = false
-                        val cur = snapshot
                         scope.launch {
+                            val cur = prepareFreshSnapshot()
                             val availBefore = SystemScanner.getCurrentAvailBytes()
-                            val extFreed = SystemScanner.cleanExternalSafeFiles(cur)
-                            GuardStore.startCleanQueue(cur.cacheCandidates, availBefore, extFreed)
+                            // 此时无障碍尚未开启，先不提前删外置文件，待用户真正打开开关后由服务启动时统一安全清理
+                            val queuedCount = GuardStore.startCleanQueue(cur.cacheCandidates, availBefore, 0L)
+                            if (queuedCount == 0) {
+                                GuardStore.postBanner("刚刚已经全部清理过啦，手机现在很干净！")
+                                refreshAll()
+                                return@launch
+                            }
                             try {
                                 context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                             } catch (_: Exception) {
@@ -367,6 +413,7 @@ fun ParentSuperGuardApp() {
                 unlockUsingRecoveryMode = false
                 unlockPinInput = ""
                 unlockError = null
+                isVerifyingPin = false
             },
             title = {
                 Text(
@@ -466,44 +513,55 @@ fun ParentSuperGuardApp() {
             },
             confirmButton = {
                 Button(
-                    enabled = !isPinLockedOut,
+                    enabled = !isPinLockedOut && !isVerifyingPin,
                     onClick = {
-                        val res = if (unlockUsingRecoveryMode) {
-                            GuardStore.attemptResetWithRecoveryCode(context, unlockPinInput)
-                        } else {
-                            GuardStore.attemptVerifyAdminPin(context, unlockPinInput)
-                        }
-                        when (res) {
-                            is PinVerifyResult.Success -> {
-                                adminUnlocked = true
-                                selectedTab = 1
-                                showUnlockDialog = false
-                                unlockUsingRecoveryMode = false
-                                unlockPinInput = ""
-                                unlockError = null
+                        val inputCopy = unlockPinInput
+                        val useRecovery = unlockUsingRecoveryMode
+                        isVerifyingPin = true
+                        unlockError = null
+                        scope.launch {
+                            val res = try {
+                                withContext(Dispatchers.Default) {
+                                    if (useRecovery) {
+                                        GuardStore.attemptResetWithRecoveryCode(context, inputCopy)
+                                    } else {
+                                        GuardStore.attemptVerifyAdminPin(context, inputCopy)
+                                    }
+                                }
+                            } finally {
+                                isVerifyingPin = false
                             }
-                            is PinVerifyResult.LockedOut -> {
-                                nowMs = System.currentTimeMillis()
-                                unlockError = "请等待 ${CleanDecisionRules.formatLockoutRemaining(res.remainingMs)} 后重试"
-                            }
-                            is PinVerifyResult.Wrong -> {
-                                nowMs = System.currentTimeMillis()
-                                unlockError = if (res.lockoutMs > 0L) {
-                                    "密码错误（已错 ${res.failedAttempts} 次），请等待 ${CleanDecisionRules.formatLockoutRemaining(res.lockoutMs)} 后再试"
-                                } else {
-                                    if (unlockUsingRecoveryMode) "恢复码不正确，请检查后重试" else "密码不正确（已错 ${res.failedAttempts} 次）"
+                            when (res) {
+                                is PinVerifyResult.Success -> {
+                                    adminUnlocked = true
+                                    selectedTab = 1
+                                    showUnlockDialog = false
+                                    unlockUsingRecoveryMode = false
+                                    unlockPinInput = ""
+                                    unlockError = null
+                                }
+                                is PinVerifyResult.LockedOut -> {
+                                    nowMs = System.currentTimeMillis()
+                                    unlockError = "请等待 ${CleanDecisionRules.formatLockoutRemaining(res.remainingMs)} 后重试"
+                                }
+                                is PinVerifyResult.Wrong -> {
+                                    nowMs = System.currentTimeMillis()
+                                    unlockError = if (res.lockoutMs > 0L) {
+                                        "密码错误（已错 ${res.failedAttempts} 次），请等待 ${CleanDecisionRules.formatLockoutRemaining(res.lockoutMs)} 后再试"
+                                    } else {
+                                        if (useRecovery) "恢复码不正确，请检查后重试" else "密码不正确（已错 ${res.failedAttempts} 次）"
+                                    }
                                 }
                             }
                         }
                     }
                 ) {
                     Text(
-                        text = if (isPinLockedOut) {
-                            "冷却 ${CleanDecisionRules.formatLockoutRemaining(pinLockoutRemainingMs)}"
-                        } else if (unlockUsingRecoveryMode) {
-                            "验证恢复码"
-                        } else {
-                            "解锁进入"
+                        text = when {
+                            isVerifyingPin -> "验证中..."
+                            isPinLockedOut -> "冷却 ${CleanDecisionRules.formatLockoutRemaining(pinLockoutRemainingMs)}"
+                            unlockUsingRecoveryMode -> "验证恢复码"
+                            else -> "解锁进入"
                         }
                     )
                 }
@@ -565,7 +623,8 @@ fun ParentSuperGuardApp() {
                     latestCleanRecord = cleanHistory.firstOrNull(),
                     hasUsageLive = hasUsageLive,
                     scanning = scanning,
-                    onStartClean = { launchCleanOrPrompt() }
+                    onStartClean = { launchCleanOrPrompt() },
+                    onRefreshAfterCancel = { refreshAll() }
                 )
             } else {
                 ChildToolsScreen(
@@ -595,7 +654,8 @@ fun ElderHomeScreen(
     latestCleanRecord: String?,
     hasUsageLive: Boolean,
     scanning: Boolean,
-    onStartClean: () -> Unit
+    onStartClean: () -> Unit,
+    onRefreshAfterCancel: () -> Unit
 ) {
     val context = LocalContext.current
     var showWechatGuide by remember { mutableStateOf(false) }
@@ -730,8 +790,8 @@ fun ElderHomeScreen(
             Spacer(Modifier.height(10.dp))
             OutlinedButton(
                 onClick = {
-                    CacheCleanAccessibilityService.instance?.stopImmediately()
-                    GuardStore.cancelCleanQueue(context)
+                    CacheCleanAccessibilityService.requestUserStop(context, bringAppToFront = false)
+                    onRefreshAfterCancel()
                 },
                 modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
                 shape = RoundedCornerShape(14.dp)

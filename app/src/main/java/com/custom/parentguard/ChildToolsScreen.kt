@@ -1,5 +1,8 @@
 package com.custom.parentguard
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
@@ -20,6 +23,9 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 「子女管理与防坑中心」页面（v6.2）：
@@ -44,6 +50,7 @@ fun ChildToolsScreen(
     onRefresh: () -> Unit
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     var showChecklist by remember { mutableStateOf(true) }
     var showNotificationCleaner by remember { mutableStateOf(false) }
@@ -51,12 +58,14 @@ fun ChildToolsScreen(
     var showOtherNormalNotifs by remember { mutableStateOf(false) }
     var expandAllOtherNotifs by remember { mutableStateOf(false) }
     var showHighCacheList by remember { mutableStateOf(false) }
+    var expandAllHighCache by remember { mutableStateOf(false) }
     var showAppAudit by remember { mutableStateOf(false) }
 
     var showPinDialog by remember { mutableStateOf(false) }
     var pinInput by remember { mutableStateOf("") }
     var pinError by remember { mutableStateOf<String?>(null) }
     var newlyGeneratedRecoveryCode by remember { mutableStateOf<String?>(null) }
+    var isSavingPin by remember { mutableStateOf(false) }
 
     fun openNotificationSettingsForApp(pkg: String) {
         GuardStore.markNotificationHandled(context, pkg)
@@ -122,6 +131,7 @@ fun ChildToolsScreen(
                 showPinDialog = false
                 pinInput = ""
                 pinError = null
+                isSavingPin = false
             },
             title = {
                 Text(
@@ -159,31 +169,69 @@ fun ChildToolsScreen(
             },
             confirmButton = {
                 Button(
+                    enabled = !isSavingPin,
                     onClick = {
                         if (!CleanDecisionRules.isValidPinFormat(pinInput)) {
                             pinError = "请输入 4 位纯数字密码"
                         } else {
-                            val code = GuardStore.setAdminPin(context, pinInput)
-                            showPinDialog = false
-                            pinInput = ""
-                            pinError = null
-                            newlyGeneratedRecoveryCode = code
+                            val pinCopy = pinInput
+                            isSavingPin = true
+                            scope.launch {
+                                val saveRes = try {
+                                    withContext(Dispatchers.Default) {
+                                        GuardStore.setAdminPin(context, pinCopy)
+                                    }
+                                } finally {
+                                    isSavingPin = false
+                                }
+                                when (saveRes) {
+                                    is PinSaveResult.Saved -> {
+                                        showPinDialog = false
+                                        pinInput = ""
+                                        pinError = null
+                                        newlyGeneratedRecoveryCode = saveRes.recoveryCode
+                                    }
+                                    is PinSaveResult.Cleared -> {
+                                        showPinDialog = false
+                                        pinInput = ""
+                                        pinError = null
+                                    }
+                                    is PinSaveResult.Failed -> {
+                                        pinError = saveRes.reason
+                                    }
+                                }
+                            }
                         }
                     }
                 ) {
-                    Text("保存密码")
+                    Text(if (isSavingPin) "加密保存中..." else "保存密码")
                 }
             },
             dismissButton = {
                 Row {
                     if (hasAdminPin) {
                         TextButton(
+                            enabled = !isSavingPin,
                             onClick = {
-                                GuardStore.setAdminPin(context, null)
-                                GuardStore.postBanner("已关闭子女管理锁。")
-                                showPinDialog = false
-                                pinInput = ""
-                                pinError = null
+                                isSavingPin = true
+                                scope.launch {
+                                    val res = try {
+                                        withContext(Dispatchers.IO) {
+                                            GuardStore.setAdminPin(context, null)
+                                        }
+                                    } finally {
+                                        isSavingPin = false
+                                    }
+                                    when (res) {
+                                        is PinSaveResult.Failed -> pinError = res.reason
+                                        else -> {
+                                            GuardStore.postBanner("已关闭子女管理锁。")
+                                            showPinDialog = false
+                                            pinInput = ""
+                                            pinError = null
+                                        }
+                                    }
+                                }
                             }
                         ) {
                             Text("关闭锁", color = Color(0xFFDC2626))
@@ -536,7 +584,8 @@ fun ChildToolsScreen(
                             fontSize = 14.5.sp, color = Color(0xFF15803D), fontWeight = FontWeight.SemiBold
                         )
                     } else {
-                        snapshot.cacheCandidates.take(20).forEach { app ->
+                        val visibleCaches = if (expandAllHighCache) snapshot.cacheCandidates else snapshot.cacheCandidates.take(15)
+                        visibleCaches.forEach { app ->
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -572,6 +621,17 @@ fun ChildToolsScreen(
                                 }
                             }
                             HorizontalDivider(color = Color(0xFFF1F5F9))
+                        }
+                        if (snapshot.cacheCandidates.size > 15) {
+                            TextButton(
+                                onClick = { expandAllHighCache = !expandAllHighCache },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = if (expandAllHighCache) "收起列表" else "展开全部（共 ${snapshot.cacheCandidates.size} 个）",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         }
                     }
                 }
@@ -702,6 +762,11 @@ fun ChildToolsScreen(
             }
         }
 
+        Spacer(Modifier.height(14.dp))
+
+        // 8. P0-0 & P2-4 独立隔离的离线诊断日志卡（折叠时不订阅 StateFlow，清理过程零整页重组）
+        DiagLogCard(cfg = cfg)
+
         Spacer(Modifier.height(24.dp))
     }
 }
@@ -793,5 +858,115 @@ private fun AntiPitfallCheckItem(
                 Text(actionText, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF2563EB))
             }
         }
+    }
+}
+
+
+@Composable
+private fun DiagLogCard(cfg: GuardConfig) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var expanded by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White)
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("清缓存诊断日志（离线排错）", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
+                    Text("纯本地记录每步点击与耗时，出问题导出发出来一眼定位", fontSize = 13.sp, color = Color(0xFF64748B))
+                }
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "收起" else "查看", fontWeight = FontWeight.Bold)
+                }
+            }
+            if (expanded) {
+                DiagLogExpandedBody(
+                    cfg = cfg,
+                    onExport = {
+                        scope.launch {
+                            val (ok, pathOrErr) = withContext(Dispatchers.IO) {
+                                CleanDiagLogger.exportNow(context)
+                            }
+                            GuardStore.postBanner(
+                                if (ok) "诊断日志已导出至：$pathOrErr" else "导出失败：$pathOrErr"
+                            )
+                        }
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DiagLogExpandedBody(
+    cfg: GuardConfig,
+    onExport: () -> Unit
+) {
+    val context = LocalContext.current
+    val diagLines by CleanDiagLogger.lines.collectAsState()
+
+    Spacer(Modifier.height(8.dp))
+    GuardRow(
+        "自动追加日志到 Download 文件夹",
+        "文件名为 ParentSuperGuard-diag-日期.txt（含本机应用名，排查完请删除）",
+        cfg.exportDiagToDownload
+    ) { GuardStore.saveConfig(context, cfg.copy(exportDiagToDownload = it)) }
+
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(
+            onClick = {
+                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                cm?.setPrimaryClip(ClipData.newPlainText("ParentSuperGuardDiag", CleanDiagLogger.getFullText()))
+                GuardStore.postBanner("已复制全部诊断日志（共 ${diagLines.size} 条）到剪贴板。")
+            },
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Text("复制日志", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        }
+        OutlinedButton(
+            onClick = onExport,
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(10.dp)
+        ) {
+            Text("导出文件", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF15803D))
+        }
+        TextButton(
+            onClick = {
+                CleanDiagLogger.clear(context)
+                GuardStore.postBanner("已清空诊断日志。")
+            }
+        ) {
+            Text("清空", fontSize = 13.sp, color = Color(0xFFDC2626))
+        }
+    }
+
+    Spacer(Modifier.height(8.dp))
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFC))
+    ) {
+        val preview = if (diagLines.isEmpty()) {
+            "暂无日志，执行一次清理后会记录每一步状态。"
+        } else {
+            "共 ${diagLines.size} 条（仅显示最近 25 条）：\n" + diagLines.takeLast(25).joinToString("\n")
+        }
+        Text(
+            text = preview,
+            modifier = Modifier.padding(12.dp),
+            fontSize = 11.5.sp,
+            color = Color(0xFF334155)
+        )
     }
 }

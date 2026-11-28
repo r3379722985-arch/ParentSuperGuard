@@ -71,7 +71,7 @@ class RogueGuardAccessibilityService : AccessibilityService() {
         super.onServiceConnected()
         instance = this
         GuardStore.setRogueServiceConnected(true)
-        GuardStore.load(this)
+        GuardStore.ensureLoaded(this)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {

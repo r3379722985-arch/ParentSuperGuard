@@ -217,4 +217,70 @@ class IroncladWhitelistTest {
         assertEquals(PermissionActionStep.ALL_DONE, PermissionStepPlanner.nextRecommendedStep(s0.copy(hasUsageStats = true, restrictedConfirmed = true, cleanServiceRunning = true, hasExternalFiles = true)))
         assertFalse(PermissionStepPlanner.shouldAutoOpenCenterOnLaunch(true, true))
     }
+
+    @Test
+    fun recentlyCleanedFilterSkipsAlreadyCleanedAppsAfterMidwayCancel() {
+        val apps = listOf("com.dragon.read", "com.ss.android.ugc.aweme", "com.xunmeng.pinduoduo")
+        val now = 1_000_000L
+        val ttl = 10L * 60_000L
+        val cleaned = mapOf(
+            "com.dragon.read" to (now - 60_000L),          // 1 分钟前刚清完 -> 必须跳过
+            "com.ss.android.ugc.aweme" to (now - 700_000L) // 11 分钟前清的 -> 已过冷却，可重新清
+        )
+        val remaining = CleanDecisionRules.filterRecentlyCleaned(apps, cleaned, now, ttl) { it }
+        assertEquals(listOf("com.ss.android.ugc.aweme", "com.xunmeng.pinduoduo"), remaining)
+    }
+
+    @Test
+    fun userInterruptionDetectsHomeAndOtherAppsWithoutFalseTriggeringSettings() {
+        val allowed = setOf("com.android.settings", "com.miui.securitycenter", "com.oplus.appdetail")
+        assertFalse(CleanDecisionRules.isUserInterruptedForeground("com.android.settings", allowed))
+        assertFalse(CleanDecisionRules.isUserInterruptedForeground("com.oplus.appdetail", allowed))
+        assertFalse(CleanDecisionRules.isUserInterruptedForeground("com.android.systemui", allowed))
+        assertFalse(CleanDecisionRules.isUserInterruptedForeground(null, allowed))
+        // 按 Home 回到桌面或切去微信 -> 判定为用户主动中断！
+        assertTrue(CleanDecisionRules.isUserInterruptedForeground("com.oppo.launcher", allowed))
+        assertTrue(CleanDecisionRules.isUserInterruptedForeground("com.miui.home", allowed))
+        assertTrue(CleanDecisionRules.isUserInterruptedForeground("com.tencent.mm", allowed))
+    }
+
+    @Test
+    fun watchdogRequiresTwoConsecutiveNonAllowedHits() {
+        val allowed = setOf("com.android.settings", "com.miui.securitycenter")
+        var hits = 0
+        hits = CleanDecisionRules.nextInterruptHits(hits, "com.miui.home", allowed)
+        assertEquals(1, hits)
+        hits = CleanDecisionRules.nextInterruptHits(hits, null, allowed)
+        assertEquals(0, hits)
+        hits = CleanDecisionRules.nextInterruptHits(hits, "com.miui.home", allowed)
+        hits = CleanDecisionRules.nextInterruptHits(hits, "com.miui.home", allowed)
+        assertEquals(2, hits)
+        hits = CleanDecisionRules.nextInterruptHits(hits, "com.miui.securitycenter", allowed)
+        assertEquals(0, hits)
+    }
+
+    @Test
+    fun benignAccountNoticeInCacheDialogIsNotFalseAborted() {
+        assertEquals(
+            DialogDecision.CONFIRM_CACHE,
+            CleanDecisionRules.evaluateCacheConfirmWindow("确定清除应用缓存？清除缓存不会影响您的账号登录 取消 确定")
+        )
+        assertEquals(
+            DialogDecision.ABORT_DANGEROUS,
+            CleanDecisionRules.evaluateCacheConfirmWindow("确定删除账号及所有本地记录？ 取消 确定")
+        )
+    }
+
+    @Test
+    fun sizeTokenExtractorDetectsStorageChangeAndIgnoresMobileTraffic() {
+        val before = CleanDecisionRules.extractSizeTokens("应用信息 拼多多 存储占用 607MB 流量消耗 881.3MB 数据流量 1.5GB 缓存 120.5 MB")
+        val after = CleanDecisionRules.extractSizeTokens("应用信息 拼多多 存储占用 486.5MB 流量消耗 882.0MB 数据流量 1.6GB 缓存 0 B")
+        assertTrue("607mb" in before)
+        assertTrue("120.5mb" in before)
+        assertFalse("881.3mb" in before)
+        assertFalse("1.5gb" in before)
+        assertNotEquals(before, after)
+        val onlyTrafficChanged = CleanDecisionRules.extractSizeTokens("应用信息 拼多多 存储占用 607MB 流量消耗 999.9MB 缓存 120.5 MB")
+        assertEquals(before, onlyTrafficChanged)
+    }
 }

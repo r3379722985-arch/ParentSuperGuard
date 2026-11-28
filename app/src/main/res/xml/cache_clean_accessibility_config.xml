@@ -7,4 +7,4 @@
     android:canRetrieveWindowContent="true"
     android:description="@string/clean_service_desc"
     android:notificationTimeout="80"
-    android:packageNames="com.android.settings,com.miui.securitycenter,com.xiaomi.misettings,com.huawei.systemmanager,com.hihonor.systemmanager,com.coloros.safecenter,com.oplus.safecenter,com.oplus.appdetail,com.iqoo.secure,com.vivo.abe,com.vivo.permissionmanager,com.vivo.appfilter,com.meizu.safe,com.samsung.android.lool" />
+    android:packageNames="com.android.settings,com.miui.securitycenter,com.xiaomi.misettings,com.huawei.systemmanager,com.hihonor.systemmanager,com.coloros.safecenter,com.oplus.safecenter,com.oplus.appdetail,com.coloros.appdetail,com.iqoo.secure,com.vivo.abe,com.vivo.appdetail,com.vivo.permissionmanager,com.vivo.appfilter,com.meizu.safe,com.samsung.android.lool" />

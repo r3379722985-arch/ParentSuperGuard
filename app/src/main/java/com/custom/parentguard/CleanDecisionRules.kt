@@ -13,13 +13,18 @@ enum class DialogDecision {
 }
 
 /**
- * 纯函数安全判定规则、PBKDF2 强哈希、恢复码与阶梯冷却计算（无 Android 框架依赖，全部由 JUnit 单元测试直接验证）。
+ * 纯函数安全判定规则、PBKDF2 强哈希、恢复码、阶梯冷却、看门狗防误判与存储大小提取（全部由 JUnit 单元测试覆盖）。
  */
 object CleanDecisionRules {
 
     const val PBKDF2_ITERATIONS = 100_000
     private const val PBKDF2_PREFIX = "pbkdf2_sha256"
     private const val RECOVERY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+    // P2-3 修复：只提取“存储/缓存/占用/数据(排除流量与网络)/storage/cache”附近的容量数字，排除“流量消耗 881.3MB”干扰
+    private val STORAGE_SIZE_CONTEXT_REGEX = Regex(
+        "(?:存储|缓存|占用|数据(?!流量|网络|使用)|storage|cache)[^0-9]{0,12}(\\d+(?:\\.\\d+)?\\s*(?:kb|mb|gb|b))\\b",
+        RegexOption.IGNORE_CASE
+    )
 
     val ABSOLUTE_FORBIDDEN = listOf(
         "清除全部数据", "清除所有数据", "删除全部数据", "删除应用数据", "删除数据", "清除存储",
@@ -32,11 +37,14 @@ object CleanDecisionRules {
         "全部数据", "所有数据", "clear all data", "clear storage"
     )
 
+    private val ACCOUNT_WIPE_PHRASES = listOf(
+        "删除账号", "清除账号", "清空账号", "账号都将", "永久删除"
+    )
+
     val NON_MIUI_FORBIDDEN = listOf(
         "清除数据", "clear data", "清空数据"
     )
 
-    // 恢复内置兜底安装风险词：即使调用方未传全词表，纯函数自身也能守住安全底线
     val BUILTIN_INSTALL_RISK_KEYWORDS = listOf(
         "未知来源", "高风险", "未经官方", "恶意", "风险应用", "安全风险", "报毒"
     )
@@ -79,11 +87,14 @@ object CleanDecisionRules {
         if (txt.contains("清除全部数据") && txt.contains("清除缓存")) {
             return DialogDecision.WAIT_TRANSITION
         }
-        if (ABSOLUTE_FORBIDDEN.any { txt.contains(it) } || txt.contains("账号")) {
+        if (ABSOLUTE_FORBIDDEN.any { txt.contains(it) } || ACCOUNT_WIPE_PHRASES.any { txt.contains(it) }) {
             return DialogDecision.ABORT_DANGEROUS
         }
         if (txt.contains("缓存") || txt.contains("cache")) {
             return DialogDecision.CONFIRM_CACHE
+        }
+        if (txt.contains("账号") || txt.contains("密码")) {
+            return DialogDecision.WAIT_TRANSITION
         }
         return DialogDecision.NOT_A_DIALOG
     }
@@ -108,11 +119,16 @@ object CleanDecisionRules {
         return (highRiskKeywords + BUILTIN_INSTALL_RISK_KEYWORDS).any { txt.contains(it.lowercase()) }
     }
 
+    fun extractSizeTokens(rawWindowText: String): Set<String> {
+        return STORAGE_SIZE_CONTEXT_REGEX.findAll(rawWindowText)
+            .mapNotNull { m -> m.groups[1]?.value?.lowercase()?.replace(" ", "") }
+            .toSet()
+    }
+
     fun isValidPinFormat(pin: String): Boolean {
         return pin.length == 4 && pin.all { it.isDigit() }
     }
 
-    /** P2-2 修复：PBKDF2WithHmacSHA256 + 10万次迭代 + 16字节随机盐 */
     fun hashPin(pin: String): String {
         val salt = ByteArray(16)
         SecureRandom().nextBytes(salt)
@@ -136,7 +152,6 @@ object CleanDecisionRules {
             val actual = derivePbkdf2(pin, salt, iterations)
             return MessageDigest.isEqual(actual, expected)
         }
-        // 平滑兼容 v6.0 / v6.1 旧版单次 SHA-256 哈希，登录成功后由 GuardStore 自动升级存盘
         val legacyExpected = fromHex(storedHash) ?: return false
         val legacyActual = legacySha256Bytes(pin)
         return MessageDigest.isEqual(legacyActual, legacyExpected)
@@ -158,7 +173,6 @@ object CleanDecisionRules {
         }
     }
 
-    /** P1-1 兜底：生成 8 位易读一次性恢复码（格式 XXXX-XXXX，不含 0/O/1/I/L） */
     fun generateRecoveryCode(): String {
         val rng = SecureRandom()
         val raw = buildString(8) {
@@ -193,7 +207,6 @@ object CleanDecisionRules {
         return MessageDigest.isEqual(actual, expected)
     }
 
-    /** P2-1 修复：防穷举阶梯式冷却策略（3次=30秒，6次=5分钟，10次及以上=30分钟） */
     fun lockoutDurationMsForFailures(failedAttempts: Int): Long {
         return when {
             failedAttempts >= 10 -> 30L * 60_000L
@@ -220,6 +233,41 @@ object CleanDecisionRules {
             }
         } catch (_: Exception) {
             null
+        }
+    }
+
+    fun <T> filterRecentlyCleaned(
+        items: List<T>,
+        recentlyCleanedTimestamps: Map<String, Long>,
+        nowMs: Long,
+        ttlMs: Long,
+        packageSelector: (T) -> String
+    ): List<T> {
+        if (recentlyCleanedTimestamps.isEmpty()) return items
+        return items.filter { item ->
+            val cleanedAt = recentlyCleanedTimestamps[packageSelector(item)] ?: return@filter true
+            (nowMs - cleanedAt) >= ttlMs
+        }
+    }
+
+    fun isUserInterruptedForeground(
+        activeWindowPkg: String?,
+        allowedSettingsPkgs: Set<String>
+    ): Boolean {
+        if (activeWindowPkg.isNullOrBlank()) return false
+        if (activeWindowPkg == "com.android.systemui") return false
+        return activeWindowPkg !in allowedSettingsPkgs
+    }
+
+    fun nextInterruptHits(
+        currentHits: Int,
+        activeWindowPkg: String?,
+        allowedSettingsPkgs: Set<String>
+    ): Int {
+        return if (isUserInterruptedForeground(activeWindowPkg, allowedSettingsPkgs)) {
+            currentHits + 1
+        } else {
+            0
         }
     }
 }

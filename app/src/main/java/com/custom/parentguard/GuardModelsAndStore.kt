@@ -15,10 +15,23 @@ enum class AppNotifState {
     UNKNOWN
 }
 
+enum class AppCleanOutcome {
+    CLEANED,
+    ALREADY_ZERO,
+    FAILED,
+    SKIPPED
+}
+
 sealed class PinVerifyResult {
     object Success : PinVerifyResult()
     data class Wrong(val failedAttempts: Int, val lockoutMs: Long) : PinVerifyResult()
     data class LockedOut(val remainingMs: Long) : PinVerifyResult()
+}
+
+sealed class PinSaveResult {
+    data class Saved(val recoveryCode: String) : PinSaveResult()
+    object Cleared : PinSaveResult()
+    data class Failed(val reason: String) : PinSaveResult()
 }
 
 data class AppCacheCandidate(
@@ -50,7 +63,8 @@ data class GuardConfig(
     val blockQuickAppPopup: Boolean = true,
     val blockRogueAppJump: Boolean = true,
     val alsoForceStopOnClean: Boolean = false,
-    val autoDisableCleanAccessibility: Boolean = true
+    val autoDisableCleanAccessibility: Boolean = true,
+    val exportDiagToDownload: Boolean = false
 )
 
 data class CleanRunState(
@@ -58,7 +72,9 @@ data class CleanRunState(
     val currentIndex: Int = 0,
     val totalCount: Int = 0,
     val currentAppName: String = "",
-    val cleanedApps: Int = 0
+    val cleanedApps: Int = 0,
+    val zeroApps: Int = 0,
+    val failedApps: Int = 0
 )
 
 data class GuardSnapshot(
@@ -72,7 +88,8 @@ data class GuardSnapshot(
     val safeLogFiles: List<File> = emptyList(),
     val safeLogBytes: Long = 0L,
     val auditedApps: List<InstalledAppAuditItem> = emptyList(),
-    val notificationCandidates: List<NotificationMuteCandidate> = emptyList()
+    val notificationCandidates: List<NotificationMuteCandidate> = emptyList(),
+    val scannedAtMs: Long = 0L
 ) {
     val usedStorageBytes: Long get() = (totalStorageBytes - availStorageBytes).coerceAtLeast(0L)
     val totalCleanableBytes: Long get() = totalAppCacheBytes + safeThumbBytes + safeLogBytes
@@ -94,6 +111,7 @@ object GuardStore {
     private const val K_JUMP = "block_jump"
     private const val K_STOP = "force_stop"
     private const val K_AUTO_OFF = "auto_off_acc"
+    private const val K_DIAG_DOWNLOAD = "export_diag_download_v1"
     private const val K_BLOCKED = "blocked_cnt"
     private const val K_LOGS = "blocked_logs_v1"
     private const val K_CLEAN_HISTORY = "clean_history_v1"
@@ -108,8 +126,10 @@ object GuardStore {
     private const val K_PIN_LOCKOUT_UNTIL = "admin_pin_lockout_until_ms_v1"
     private const val K_NOTIF_HANDLED = "notif_handled_pkgs_v1"
     private const val K_MIGRATED_LEGACY = "migrated_legacy_prefs_v1"
+    private const val K_RECENTLY_CLEANED = "recently_cleaned_pkgs_v1"
 
     const val MAX_APPS_PER_BATCH = 20
+    const val RECENTLY_CLEANED_TTL_MS = 10L * 60_000L
 
     private val _config = MutableStateFlow(GuardConfig())
     val config: StateFlow<GuardConfig> = _config.asStateFlow()
@@ -165,13 +185,21 @@ object GuardStore {
     private val _restrictedConfirmed = MutableStateFlow(false)
     val restrictedConfirmed: StateFlow<Boolean> = _restrictedConfirmed.asStateFlow()
 
+    @Volatile private var hasLoadedOnce: Boolean = false
     @Volatile var queue: List<AppCacheCandidate> = emptyList(); private set
     @Volatile var queueIndex: Int = 0; private set
     @Volatile var cleanedInSession: Int = 0; private set
+    @Volatile var zeroInSession: Int = 0; private set
+    @Volatile var failedInSession: Int = 0; private set
+    @Volatile var skippedInSession: Int = 0; private set
     @Volatile var remainingOverflowCount: Int = 0; private set
     @Volatile var sessionActive: Boolean = false; private set
     @Volatile var availBytesBeforeClean: Long = 0L; private set
     @Volatile var extFreedBeforeQueue: Long = 0L; private set
+    @Volatile var sessionStartedAtMs: Long = 0L; private set
+
+    private val recentLock = Any()
+    @Volatile private var recentlyCleanedPkgs: Map<String, Long> = emptyMap()
 
     fun setCleanServiceConnected(connected: Boolean) {
         _cleanServiceConnected.value = connected
@@ -183,6 +211,39 @@ object GuardStore {
 
     fun postBanner(msg: String?) {
         _bannerMessage.value = msg
+    }
+
+    fun getActiveRecentlyCleaned(nowMs: Long = System.currentTimeMillis()): Map<String, Long> {
+        synchronized(recentLock) {
+            val active = recentlyCleanedPkgs.filterValues { (nowMs - it) < RECENTLY_CLEANED_TTL_MS }
+            if (active.size != recentlyCleanedPkgs.size) {
+                recentlyCleanedPkgs = active
+            }
+            return active
+        }
+    }
+
+    fun markPackageRecentlyCleaned(context: Context, packageName: String) {
+        val snapshotCopy: Map<String, Long>
+        synchronized(recentLock) {
+            val now = System.currentTimeMillis()
+            val updated = recentlyCleanedPkgs.filterValues { (now - it) < RECENTLY_CLEANED_TTL_MS }.toMutableMap()
+            updated[packageName] = now
+            snapshotCopy = updated.toMap()
+            recentlyCleanedPkgs = snapshotCopy
+        }
+        persistRecentlyCleaned(context, snapshotCopy)
+    }
+
+    private fun persistRecentlyCleaned(context: Context, map: Map<String, Long>) {
+        try {
+            val encoded = map.entries.joinToString("\n") { "${it.key}=${it.value}" }
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(K_RECENTLY_CLEANED, encoded)
+                .apply()
+        } catch (_: Exception) {
+        }
     }
 
     fun markOnboardingCompleted(context: Context, done: Boolean = true) {
@@ -236,48 +297,43 @@ object GuardStore {
         }
     }
 
-    /**
-     * 设置或关闭 4 位管理锁：
-     * - 设置时采用 PBKDF2-HMAC-SHA256 随机盐存储，并同步生成 8 位一次性恢复码（返回明文供一次性展示抄录）；
-     * - 关闭时清除密码、恢复码及冷却计数。
-     */
-    fun setAdminPin(context: Context, pin: String?): String? {
+    fun setAdminPin(context: Context, pin: String?): PinSaveResult {
         return try {
             val sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             if (pin.isNullOrBlank()) {
-                _adminPinHash.value = null
-                _recoveryCodeHash.value = null
-                _pinFailedAttempts.value = 0
-                _pinLockoutUntilMs.value = 0L
                 sp.edit()
                     .remove(K_ADMIN_PIN_HASH)
                     .remove(K_RECOVERY_HASH)
                     .putInt(K_PIN_FAILED_COUNT, 0)
                     .putLong(K_PIN_LOCKOUT_UNTIL, 0L)
                     .apply()
-                null
+                _adminPinHash.value = null
+                _recoveryCodeHash.value = null
+                _pinFailedAttempts.value = 0
+                _pinLockoutUntilMs.value = 0L
+                PinSaveResult.Cleared
             } else {
                 val pinHash = CleanDecisionRules.hashPin(pin)
                 val recoveryCode = CleanDecisionRules.generateRecoveryCode()
                 val recHash = CleanDecisionRules.hashRecoveryCode(recoveryCode)
-                _adminPinHash.value = pinHash
-                _recoveryCodeHash.value = recHash
-                _pinFailedAttempts.value = 0
-                _pinLockoutUntilMs.value = 0L
-                sp.edit()
+                val ok = sp.edit()
                     .putString(K_ADMIN_PIN_HASH, pinHash)
                     .putString(K_RECOVERY_HASH, recHash)
                     .putInt(K_PIN_FAILED_COUNT, 0)
                     .putLong(K_PIN_LOCKOUT_UNTIL, 0L)
-                    .apply()
-                recoveryCode
+                    .commit()
+                if (!ok) return PinSaveResult.Failed("加密密码写入失败，请检查手机剩余空间")
+                _adminPinHash.value = pinHash
+                _recoveryCodeHash.value = recHash
+                _pinFailedAttempts.value = 0
+                _pinLockoutUntilMs.value = 0L
+                PinSaveResult.Saved(recoveryCode)
             }
-        } catch (_: Exception) {
-            null
+        } catch (e: Exception) {
+            PinSaveResult.Failed("密码保存异常：${e.message ?: "未知错误"}")
         }
     }
 
-    /** P2-1 & P2-2 修复：带持久化防穷举冷却校验，并自动将旧版 SHA-256 哈希平滑升级为 PBKDF2 */
     fun attemptVerifyAdminPin(context: Context, pin: String): PinVerifyResult {
         val stored = _adminPinHash.value ?: return PinVerifyResult.Success
         val now = System.currentTimeMillis()
@@ -315,13 +371,11 @@ object GuardStore {
         }
     }
 
-    /** P1-1 修复：通过系统锁屏密码/指纹验证后，无损清除管理锁（绝不丢失保护名单与历史数据） */
     fun resetAdminPinBySystemAuth(context: Context) {
         setAdminPin(context, null)
         postBanner("已通过手机锁屏验证关闭管理锁，您的白名单与设置均已完整保留。")
     }
 
-    /** P1-1 兜底：通过 8 位一次性恢复码重置管理锁（同样受冷却保护防穷举） */
     fun attemptResetWithRecoveryCode(context: Context, code: String): PinVerifyResult {
         val storedRec = _recoveryCodeHash.value ?: return PinVerifyResult.Wrong(_pinFailedAttempts.value + 1, 0L)
         val now = System.currentTimeMillis()
@@ -361,7 +415,6 @@ object GuardStore {
         }
     }
 
-    /** 恢复从 v5.4 及更早版本直升级到 v6.2 的平滑配置迁移，不丢失保护名单与计数 */
     private fun migrateLegacyPrefsIfNeeded(context: Context) {
         try {
             val current = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -393,6 +446,14 @@ object GuardStore {
         }
     }
 
+    fun ensureLoaded(context: Context) {
+        if (!hasLoadedOnce) {
+            load(context)
+        }
+        CleanDiagLogger.ensureLoaded(context)
+    }
+
+    @Synchronized
     fun load(context: Context) {
         try {
             migrateLegacyPrefsIfNeeded(context)
@@ -402,7 +463,8 @@ object GuardStore {
                 blockQuickAppPopup = sp.getBoolean(K_QUICK, true),
                 blockRogueAppJump = sp.getBoolean(K_JUMP, true),
                 alsoForceStopOnClean = sp.getBoolean(K_STOP, false),
-                autoDisableCleanAccessibility = sp.getBoolean(K_AUTO_OFF, true)
+                autoDisableCleanAccessibility = sp.getBoolean(K_AUTO_OFF, true),
+                exportDiagToDownload = sp.getBoolean(K_DIAG_DOWNLOAD, false)
             )
             _blockedCount.value = sp.getInt(K_BLOCKED, 0)
             val savedLogs = sp.getString(K_LOGS, "") ?: ""
@@ -421,6 +483,23 @@ object GuardStore {
             _guardPausedUntilMs.value = if (savedPaused > System.currentTimeMillis()) savedPaused else 0L
             _onboardingCompleted.value = sp.getBoolean(K_ONBOARDING_DONE, false)
             _restrictedConfirmed.value = sp.getBoolean(K_RESTRICTED_OK, false)
+            synchronized(recentLock) {
+                val now = System.currentTimeMillis()
+                val rawRecent = sp.getString(K_RECENTLY_CLEANED, "") ?: ""
+                val parsedRecent = mutableMapOf<String, Long>()
+                rawRecent.split("\n").forEach { line ->
+                    val idx = line.indexOf('=')
+                    if (idx > 0) {
+                        val pkg = line.substring(0, idx).trim()
+                        val ts = line.substring(idx + 1).trim().toLongOrNull() ?: 0L
+                        if (pkg.isNotEmpty() && (now - ts) < RECENTLY_CLEANED_TTL_MS) {
+                            parsedRecent[pkg] = ts
+                        }
+                    }
+                }
+                recentlyCleanedPkgs = parsedRecent.toMap()
+            }
+            hasLoadedOnce = true
         } catch (_: Exception) {
         }
     }
@@ -434,6 +513,7 @@ object GuardStore {
                 .putBoolean(K_JUMP, cfg.blockRogueAppJump)
                 .putBoolean(K_STOP, cfg.alsoForceStopOnClean)
                 .putBoolean(K_AUTO_OFF, cfg.autoDisableCleanAccessibility)
+                .putBoolean(K_DIAG_DOWNLOAD, cfg.exportDiagToDownload)
                 .apply()
             _config.value = cfg
         } catch (_: Exception) {
@@ -489,14 +569,26 @@ object GuardStore {
         }
     }
 
-    fun startCleanQueue(allApps: List<AppCacheCandidate>, availBeforeBytes: Long, extFreedBytes: Long) {
-        val batch = allApps.take(MAX_APPS_PER_BATCH)
-        remainingOverflowCount = (allApps.size - batch.size).coerceAtLeast(0)
+    fun startCleanQueue(allApps: List<AppCacheCandidate>, availBeforeBytes: Long, extFreedBytes: Long): Int {
+        val now = System.currentTimeMillis()
+        val uncleaned = CleanDecisionRules.filterRecentlyCleaned(
+            items = allApps,
+            recentlyCleanedTimestamps = getActiveRecentlyCleaned(now),
+            nowMs = now,
+            ttlMs = RECENTLY_CLEANED_TTL_MS,
+            packageSelector = { it.packageName }
+        )
+        val batch = uncleaned.take(MAX_APPS_PER_BATCH)
+        remainingOverflowCount = (uncleaned.size - batch.size).coerceAtLeast(0)
         queue = batch
         queueIndex = 0
         cleanedInSession = 0
+        zeroInSession = 0
+        failedInSession = 0
+        skippedInSession = 0
         availBytesBeforeClean = availBeforeBytes
         extFreedBeforeQueue = extFreedBytes
+        sessionStartedAtMs = now
         sessionActive = batch.isNotEmpty()
         _bannerMessage.value = null
         _cleanState.value = CleanRunState(
@@ -504,41 +596,101 @@ object GuardStore {
             currentIndex = if (sessionActive) 1 else 0,
             totalCount = batch.size,
             currentAppName = batch.firstOrNull()?.appName ?: "",
-            cleanedApps = 0
+            cleanedApps = 0,
+            zeroApps = 0,
+            failedApps = 0
         )
+        return batch.size
     }
 
     fun currentApp(): AppCacheCandidate? = queue.getOrNull(queueIndex)
 
-    fun advanceCleanQueue(context: Context, didClean: Boolean, currentAvailBytes: Long): AppCacheCandidate? {
+    fun addExternalFreedBytes(bytes: Long) {
+        if (bytes > 0L) {
+            extFreedBeforeQueue += bytes
+        }
+    }
+
+    fun advanceCleanQueue(context: Context, outcome: AppCleanOutcome, currentAvailBytes: Long): AppCacheCandidate? {
         if (!sessionActive) return null
-        if (didClean) cleanedInSession++
+        val finishedApp = queue.getOrNull(queueIndex)
+        when (outcome) {
+            AppCleanOutcome.CLEANED -> {
+                cleanedInSession++
+                if (finishedApp != null) markPackageRecentlyCleaned(context, finishedApp.packageName)
+            }
+            AppCleanOutcome.ALREADY_ZERO -> {
+                zeroInSession++
+                if (finishedApp != null) markPackageRecentlyCleaned(context, finishedApp.packageName)
+            }
+            AppCleanOutcome.FAILED -> failedInSession++
+            AppCleanOutcome.SKIPPED -> skippedInSession++
+        }
+
+        val total = queue.size
         queueIndex++
         val next = queue.getOrNull(queueIndex)
+        CleanDiagLogger.log(
+            context,
+            "advance pkg=${finishedApp?.packageName ?: "?"} outcome=$outcome progress=$queueIndex/$total next=${next?.packageName ?: "DONE"}"
+        )
+
         if (next == null) {
+            val elapsedSec = ((System.currentTimeMillis() - sessionStartedAtMs) / 1000L).coerceAtLeast(1L)
             val delta = if (availBytesBeforeClean > 0L && currentAvailBytes > availBytesBeforeClean) {
                 currentAvailBytes - availBytesBeforeClean
             } else {
                 extFreedBeforeQueue
             }
-            recordCleanHistory(context, cleanedInSession, delta)
-            val spaceNote = if (delta >= 1024L * 1024L) {
-                "，手机腾出空间约 ${SystemScanner.formatBytes(delta)}"
-            } else ""
-            val moreNote = if (remainingOverflowCount > 0) {
-                "（已优先清完缓存最大的前 $MAX_APPS_PER_BATCH 个，其余 $remainingOverflowCount 个可按需再清）"
-            } else ""
-            finishCleanQueue("全部安全清理完成！共清理 $cleanedInSession 个软件缓存$spaceNote$moreNote。微信、银行与相册均已绝对保护。")
+            CleanDiagLogger.log(
+                context,
+                "done cleaned=$cleanedInSession zero=$zeroInSession failed=$failedInSession skipped=$skippedInSession freed=${SystemScanner.formatBytes(delta)} elapsed=${elapsedSec}s"
+            )
+            if (cleanedInSession > 0 || delta >= 1024L * 1024L) {
+                recordCleanHistory(context, cleanedInSession, delta)
+            }
+
+            val msg = buildHonestFinishBanner(delta)
+            finishCleanQueue(msg)
             return null
         }
+
         _cleanState.value = CleanRunState(
             running = true,
             currentIndex = queueIndex + 1,
             totalCount = queue.size,
             currentAppName = next.appName,
-            cleanedApps = cleanedInSession
+            cleanedApps = cleanedInSession,
+            zeroApps = zeroInSession,
+            failedApps = failedInSession
         )
         return next
+    }
+
+    private fun buildHonestFinishBanner(freedBytes: Long): String {
+        val spaceNote = if (freedBytes >= 1024L * 1024L) {
+            "，腾出空间约 ${SystemScanner.formatBytes(freedBytes)}"
+        } else ""
+        val moreNote = if (remainingOverflowCount > 0) {
+            "（其余 $remainingOverflowCount 个可按需再清）"
+        } else ""
+
+        return when {
+            cleanedInSession > 0 -> {
+                val extraParts = mutableListOf<String>()
+                if (zeroInSession > 0) extraParts.add("${zeroInSession} 个已为空")
+                if (skippedInSession > 0) extraParts.add("${skippedInSession} 个已保护跳过")
+                if (failedInSession > 0) extraParts.add("${failedInSession} 个未命中按钮")
+                val extraText = if (extraParts.isNotEmpty()) "（${extraParts.joinToString("、")}）" else ""
+                "安全清理完成！成功清理 $cleanedInSession 个软件缓存$spaceNote$extraText$moreNote。微信、银行与相册均已保护。"
+            }
+            zeroInSession > 0 && failedInSession == 0 -> {
+                "检查完成，这 $zeroInSession 个软件缓存已经很干净了$spaceNote，不用重复清理。"
+            }
+            else -> {
+                "本次未清出缓存（${zeroInSession} 个已为空、${skippedInSession} 个已保护跳过、${failedInSession} 个未命中按钮），可请孩子在「子女设置 → 诊断日志」查看原因。"
+            }
+        }
     }
 
     fun finishCleanQueue(msg: String) {
@@ -550,13 +702,27 @@ object GuardStore {
             currentIndex = 0,
             totalCount = 0,
             currentAppName = "",
-            cleanedApps = cleanedInSession
+            cleanedApps = cleanedInSession,
+            zeroApps = zeroInSession,
+            failedApps = failedInSession
         )
         _bannerMessage.value = msg
     }
 
-    fun cancelCleanQueue(context: Context? = null) {
+    fun cancelCleanQueue(context: Context? = null, includeCurrentCleaned: Boolean = false) {
         if (sessionActive) {
+            val cur = queue.getOrNull(queueIndex)
+            if (includeCurrentCleaned && cur != null) {
+                cleanedInSession++
+                if (context != null) {
+                    markPackageRecentlyCleaned(context, cur.packageName)
+                }
+            }
+            val elapsedSec = ((System.currentTimeMillis() - sessionStartedAtMs) / 1000L).coerceAtLeast(1L)
+            CleanDiagLogger.log(
+                context,
+                "cancelled cleaned=$cleanedInSession zero=$zeroInSession failed=$failedInSession elapsed=${elapsedSec}s"
+            )
             if (context != null && cleanedInSession > 0) {
                 val nowAvail = SystemScanner.getCurrentAvailBytes()
                 val delta = if (availBytesBeforeClean > 0L && nowAvail > availBytesBeforeClean) {
@@ -566,7 +732,7 @@ object GuardStore {
                 }
                 recordCleanHistory(context, cleanedInSession, delta)
             }
-            finishCleanQueue("已停止清理（本次已安全清理 $cleanedInSession 个软件）。")
+            finishCleanQueue("已停止清理（本次已安全清理 $cleanedInSession 个软件；下次点清理会自动跳过刚清完的，接着清理剩下的）。")
         }
     }
 
