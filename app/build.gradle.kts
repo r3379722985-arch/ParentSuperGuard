@@ -7,7 +7,7 @@ val ciRunNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0
 val computedVersionCode = 31 + ciRunNumber
 val computedVersionName = System.getenv("RELEASE_VERSION_NAME")
     ?.takeIf { it.isNotBlank() }
-    ?: "7.1"
+    ?: "7.2"
 
 val envStoreFilePath = System.getenv("SIGNING_STORE_FILE")?.takeIf { it.isNotBlank() }
 val envStoreFile = envStoreFilePath?.let { file(it) }?.takeIf { it.exists() }

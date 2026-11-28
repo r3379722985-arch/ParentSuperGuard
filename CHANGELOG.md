@@ -1,5 +1,19 @@
 # 更新日志（Changelog）
 
+## v7.2（致命修复：无障碍服务配置从未被系统加载 —— 清理功能此前完全失效）
+* **[P0] 修复 `<meta-data android:name>` 写错导致 AccessibilityServiceInfo 为空**：
+  此前两个服务都写成 `android.accessibilityservice.accessibilityservice`（错误 Key），
+  系统读不到 `res/xml/*_accessibility_config.xml`，于是绑定到的服务是**空配置**：
+  `eventTypes=0`、`capabilities=0`（既收不到无障碍事件，也读不到窗口内容、无法注入手势）。
+  后果：清理队列能跑、悬浮条能显示进度、日志也在记，但**任何一个软件都匹配不到按钮**，
+  全部走 5.2 秒超时 → `cleaned=0 failed=N`，也就是“看着在清、其实一个都没清”。
+  真机证据（v7.1 实测）：
+    dumpsys accessibility → `Service[label=安心卫士 · 自动清缓存（清完即关）, feedbackType[], capabilities=0, eventTypes=, notificationTimeout=0]`
+    diag 日志 → `TIMEOUT step=APP_INFO outcome=FAILED` × 7 → `done cleaned=0 failed=7`
+  已改为正确 Key `android:name="android.accessibilityservice"`（两个服务都改）。
+* 该 Bug 自 v5.4 首个版本即存在，是历次“清不干净 / 反复重开 / 0B 置灰”问题的真正根因；
+  之前各版本对状态机的修补都是在错误前提上打补丁。
+
 ## v7.1（零主线程 I/O + 体积精准核验 + 全项体验精修版）
 针对 v7.0 真机审查日志中的所有 P1 / P2 / P3 问题逐条修复完毕：
 
